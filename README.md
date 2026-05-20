@@ -103,3 +103,7 @@ in detail in the consumer repo
   `.settings`, etc.) instead of `ClientModule`.
 
 The script is idempotent — running it twice is a no-op.
+
+See **[ENHANCEMENTS.md](./ENHANCEMENTS.md)** for the full inventory of all
+13 type-quality changes we ship vs. vanilla CCBlueX output, with rationale
+and step-by-step regeneration mechanics.
