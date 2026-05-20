@@ -280,6 +280,19 @@ These are documented in `liquidbounce-helper/docs/upstream-type-issues/`:
 
 ---
 
+## Script-author runtime compatibility under JDK 25
+
+The infrastructure changes (I-01, I-02) work around the same JDK 25
+`@CallerSensitive` regression that bites *user-written* LiquidBounce
+scripts. If your script uses raw reflection, `Class.forName`,
+`Thread.getContextClassLoader`, `new URLClassLoader(...)`, or other
+caller-sensitive APIs, see
+[`liquidbounce-helper/docs/48-jdk25-script-compat.md`](https://github.com/clawdbot-silly-waddle/liquidbounce-helper/blob/main/docs/48-jdk25-script-compat.md)
+for the full list of affected JDK methods and the
+`Java.type` / helper-mod migration patterns.
+
+---
+
 ## How to run the regen end-to-end
 
 | Goal | How |
