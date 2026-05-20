@@ -245,14 +245,33 @@ total_subs = 0
 changed_files = 0
 start = time.time()
 
+# Skip identifier-rename inside /** ... */ block comments (TSDoc / JSDoc).
+# These are user-facing prose where keyword-suffixing the wrong word would
+# turn correct example code into nonsense (e.g. `default:` in @example).
+COMMENT_BLOCK = re.compile(r"/\*\*(?:[^*]|\*(?!/))*\*/")
+
 for path in types_root.rglob("*.d.ts"):
     total_files += 1
     text = path.read_text()
-    new_text, n = PARAM_NAME.subn(r"\1\2_\3", text)
-    if n:
-        path.write_text(new_text)
+    # Split into [code, comment, code, comment, ...]; even indices are code.
+    parts = COMMENT_BLOCK.split(text)
+    comments = COMMENT_BLOCK.findall(text)
+    file_subs = 0
+    for i, segment in enumerate(parts):
+        new_segment, n = PARAM_NAME.subn(r"\1\2_\3", segment)
+        if n:
+            parts[i] = new_segment
+            file_subs += n
+    if file_subs:
+        # Re-interleave: parts[0] + comments[0] + parts[1] + comments[1] + …
+        rebuilt = []
+        for i, p in enumerate(parts):
+            rebuilt.append(p)
+            if i < len(comments):
+                rebuilt.append(comments[i])
+        path.write_text("".join(rebuilt))
         changed_files += 1
-        total_subs += n
+        total_subs += file_subs
 
 elapsed = time.time() - start
 print(
@@ -538,5 +557,201 @@ else:
     print(f"post-patches: T-7 skip — raw curve signature not found in {path.name}")
 PY
 fi
+
+# -----------------------------------------------------------------------------
+# T-Doc (Phase A POC) — inject TSDoc comments on a curated set of high-traffic
+# script-facing methods so authors get docstring tooltips in VS Code without
+# having to read Kotlin source. This is a manual seed; the eventual fix
+# (Issue #11) is a kdoc-extractor → ts-generator pipeline that automates the
+# whole surface. For now, hard-coding the highest-traffic ~5 endpoints proves
+# the rendering pathway works and gives immediate UX lift.
+#
+# Source of each docstring is recorded in a `Source:` line so future
+# automation can verify/replace them.
+
+python3 - "$PKG_ROOT" <<'PY'
+import sys, re
+from pathlib import Path
+
+root = Path(sys.argv[1])
+
+# Each entry: (relative file path under root,
+#              marker — the exact line we anchor before,
+#              docstring text — already wrapped in /** ... */ with leading indent)
+# Idempotency: skip if the docstring's first line is already present
+# directly above the marker.
+
+DOCS = [
+    # PolyglotScript.registerScript on the ambient global (post-patches P-01-prime
+    # rewrites this from the Java-bridge class form).
+    (
+        "ambient/ambient.d.ts",
+        "    export const registerScript: (scriptObject: { name: string; version: string; authors: string[] }) => PolyglotScript_;",
+        """    /**
+     * Registers a new script with LiquidBounce. **Must be called exactly once**
+     * at the top level of every script — the return value is your script
+     * handle (used to register modules, listen for lifecycle events, etc.).
+     *
+     * @param scriptObject Identity metadata for this script.
+     * @param scriptObject.name Display name. Shown in the script manager.
+     * @param scriptObject.version Semver-ish version string.
+     * @param scriptObject.authors One or more author names.
+     * @returns The script handle for chaining further registrations.
+     *
+     * @example
+     * ```ts
+     * const script = registerScript({
+     *     name: "MyScript",
+     *     version: "1.0.0",
+     *     authors: ["me"],
+     * });
+     *
+     * script.on("load", () => print("loaded"));
+     * ```
+     *
+     * Source: `PolyglotScript.kt` — `RegisterScript.apply`, KDoc.
+     */""",
+    ),
+    # PolyglotScript.registerModule
+    (
+        "types/net/ccbluex/liquidbounce/script/PolyglotScript.d.ts",
+        "    registerModule(moduleObject: { name: string; category: string; [key: string]: unknown }, callback: (mod: ScriptModule) => void): void;",
+        """    /**
+     * Registers a new module backed by this script. The callback receives a
+     * fully-constructed {@link ScriptModule} which you configure (settings,
+     * event handlers, render logic) before returning. The module is added
+     * to LiquidBounce's module manager as soon as your script is enabled.
+     *
+     * @param moduleObject Metadata describing the module.
+     * @param moduleObject.name Display name shown in the ClickGUI.
+     * @param moduleObject.category One of `"Combat" | "Movement" | "Player" | "Render" | "World" | "Misc" | "Fun" | "Exploit" | "Client"`.
+     * @param callback Configurator invoked once at registration. Use it to
+     *                 declare settings (`module.setting.boolean(...)`),
+     *                 bind events (`module.on(...)`), and define behaviour.
+     *
+     * @example
+     * ```ts
+     * script.registerModule({ name: "MyModule", category: "Misc" }, (mod) => {
+     *     const enabled = mod.setting.boolean({ name: "loud", default: false });
+     *     mod.on("enable", () => print("on"));
+     * });
+     * ```
+     *
+     * Source: `PolyglotScript.kt:213` — KDoc on `fun registerModule`.
+     */""",
+    ),
+    # PolyglotScript.on — literal-event overload (the narrow one only; the
+    # @deprecated fallback already has a comment so we leave it alone).
+    (
+        "types/net/ccbluex/liquidbounce/script/PolyglotScript.d.ts",
+        '    on(eventName: "load" | "enable" | "disable", handler: () => void): void;',
+        """    /**
+     * Binds a handler to one of this script's lifecycle events.
+     *
+     * @param eventName Lifecycle event to listen for:
+     *   - `"load"` — fired once when LiquidBounce finishes loading this
+     *               script source (before any module registration takes
+     *               effect). Use it for one-time global setup.
+     *   - `"enable"` — fired every time the user enables this script in
+     *                 the script manager (after `load`, and after each
+     *                 hot-reload).
+     *   - `"disable"` — fired when the user disables / unloads this
+     *                  script. Use it to release resources, unbind
+     *                  external listeners, etc.
+     * @param handler Zero-argument callback. None of the three lifecycle
+     *                events carry a payload.
+     *
+     * @example
+     * ```ts
+     * script.on("enable", () => print("hello"));
+     * script.on("disable", () => print("bye"));
+     * ```
+     *
+     * Source: `PolyglotScript.kt:282` — KDoc on `fun on`; payload shape
+     * confirmed by `callGlobalEvent` call sites.
+     */""",
+    ),
+    # ValueGroup.curve (T-7 receiver-lambda form)
+    (
+        "types/net/ccbluex/liquidbounce/config/types/group/ValueGroup.d.ts",
+        "    curve(name: string, block: (this: CurveValue$Builder) => void): CurveValue;",
+        """    /**
+     * Declares a {@link CurveValue} setting using the Kotlin-DSL-style
+     * builder. Inside the `block`, `this` is bound to {@link CurveValue$Builder}
+     * so you can configure curve points fluently. **Use a `function` (not an
+     * arrow), or the `this` binding will be lost.**
+     *
+     * @param name Display name of the setting.
+     * @param block Builder configurator. `this` is the curve builder.
+     * @returns The curve setting, which you can use to read interpolated
+     *          values at runtime.
+     *
+     * @example
+     * ```ts
+     * const easing = group.curve("Speed Curve", function () {
+     *     this.tension = 0.5;
+     *     // configure points...
+     * });
+     * ```
+     *
+     * Source: `ValueGroup.kt:502` — inline DSL builder. (Method has no
+     * KDoc in upstream; this docstring is authored locally.)
+     */""",
+    ),
+    # ScriptSetting.boolean — pick one factory as POC; the others can be
+    # auto-generated later by the kdoc-extractor pipeline.
+    (
+        "types/net/ccbluex/liquidbounce/script/bindings/features/ScriptSetting.d.ts",
+        "    boolean(option: { name: string; default: boolean }): Value<boolean>;",
+        """    /**
+     * Creates a boolean setting (rendered as a toggle / checkbox in the
+     * ClickGUI). The value can be read via `.get()` at runtime.
+     *
+     * @param option.name Display name shown in the ClickGUI.
+     * @param option.default Initial value if the user hasn't changed it.
+     * @returns The setting handle. Call `.get()` to read the current value.
+     *
+     * @example
+     * ```ts
+     * const loud = mod.setting.boolean({ name: "Loud", default: false });
+     * if (loud.get()) print("loud!");
+     * ```
+     *
+     * Source: `ScriptSetting.kt:43` — `fun boolean(value: PolyglotValue)`,
+     * reads the `name` and `default` members. Class-level KDoc states
+     * "Object used by the script API to provide an idiomatic way of
+     * creating module values."
+     */""",
+    ),
+]
+
+injected = 0
+skipped_present = 0
+skipped_missing = 0
+
+for rel, marker, doc in DOCS:
+    path = root / rel
+    if not path.exists():
+        skipped_missing += 1
+        continue
+    src = path.read_text()
+    # Build the block to insert (doc + newline + marker).
+    block = doc + "\n" + marker
+    if block in src:
+        skipped_present += 1
+        continue
+    if marker not in src:
+        skipped_missing += 1
+        continue
+    # Single replacement (file may legitimately contain the marker once).
+    src = src.replace(marker, block, 1)
+    path.write_text(src)
+    injected += 1
+
+print(
+    f"post-patches: T-Doc injected {injected}/{len(DOCS)} TSDoc blocks "
+    f"({skipped_present} already present, {skipped_missing} missing target)"
+)
+PY
 
 echo "post-patches: done ($PKG_ROOT)"
