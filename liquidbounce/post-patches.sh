@@ -189,4 +189,73 @@ if register_module_new not in path.read_text():
     sys.exit(2)
 PY
 
+# T-3: rename TS reserved-word parameter names across all generated
+# .d.ts files under types/. These appear because ntrrgc/ts-generator copies
+# parameter names verbatim from the Java/Kotlin bytecode, where synthetic or
+# anonymous params can be emitted as identifiers that happen to collide with
+# TS reserved words (e.g. `null` for inner-class outer references, `in`/`var`
+# /`function`/`yield`/`await` for fastutil/Guava methods). Each occurrence
+# triggers TS1390/TS1359/TS1138 parse errors and pollutes `tsc` output even
+# when the user's own code is clean.
+#
+# Strategy: ONLY transform identifiers that are unambiguously in parameter
+# position — preceded by `(` or `, ` and followed by `?: ` or `: `. Append a
+# single `_` to disambiguate from the keyword. Idempotent because the
+# renamed form (e.g. `null_`) no longer matches the pattern.
+python3 - "$PKG_ROOT/types" <<'PY'
+import re, sys, time
+from pathlib import Path
+
+types_root = Path(sys.argv[1])
+if not types_root.is_dir():
+    print(f"post-patches: skipping T-3 — {types_root} not a directory", file=sys.stderr)
+    sys.exit(0)
+
+# Reserved words that cannot be used as identifiers in TS strict mode.
+RESERVED = (
+    "break|case|catch|class|const|continue|debugger|default|delete|do|else|"
+    "enum|export|extends|false|finally|for|function|if|import|in|instanceof|"
+    "new|null|return|super|switch|this|throw|true|try|typeof|var|void|while|"
+    "with|implements|interface|let|package|private|protected|public|static|"
+    "yield|await"
+)
+
+# Match identifier in parameter position. Three groups:
+#   1: the leading char(s) we want to preserve verbatim (`(`, `,`, `<` or
+#      whitespace after them).
+#   2: the reserved word itself.
+#   3: the trailing context (`?:` or `:` followed by whitespace).
+#
+# We rely on the param-list-like syntax that always brackets the identifier
+# between an opening bracket / comma and a colon. This is precise enough to
+# avoid hitting return type positions (which are preceded by `)` not `(`)
+# and union/intersection types (which use `|` and `&`, never `:`).
+PARAM_NAME = re.compile(
+    r"([\(,]\s*(?:readonly\s+)?(?:\.{3})?)"
+    rf"({RESERVED})"
+    r"(\??:\s)"
+)
+
+total_files = 0
+total_subs = 0
+changed_files = 0
+start = time.time()
+
+for path in types_root.rglob("*.d.ts"):
+    total_files += 1
+    text = path.read_text()
+    new_text, n = PARAM_NAME.subn(r"\1\2_\3", text)
+    if n:
+        path.write_text(new_text)
+        changed_files += 1
+        total_subs += n
+
+elapsed = time.time() - start
+print(
+    f"post-patches: T-3 renamed reserved-word params — "
+    f"{total_subs} substitutions across {changed_files}/{total_files} files "
+    f"({elapsed:.1f}s)"
+)
+PY
+
 echo "post-patches: done ($PKG_ROOT)"
