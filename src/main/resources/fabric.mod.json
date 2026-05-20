@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "ts_generator",
+  "version": "1.1.4",
+  "name": "TS Generator (LiquidBounce typegen helper)",
+  "description": "Kotlin reflection -> TypeScript generator used by LiquidBounce's script-api type regeneration. Packaged as a Fabric mod so the Knot classloader loads its classes onto the runtime classpath, letting LB's GraalVM polyglot ts-defgen.js reach them via Java.type(...).",
+  "license": "Apache-2.0",
+  "environment": "*",
+  "depends": {
+    "fabricloader": ">=0.16.0"
+  },
+  "custom": {
+    "modmenu": {
+      "badges": ["library"]
+    }
+  }
+}
