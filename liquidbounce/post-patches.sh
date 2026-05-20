@@ -258,4 +258,100 @@ print(
 )
 PY
 
+# T-4: declare GraalVM JS intrinsics inside the ambient `declare global { }`
+# block. These are exposed by the GraalVM Truffle host to every script as
+# top-level bindings but are NOT enumerable via Object.entries(globalThis)
+# (they live as non-enumerable host-provided properties on the global), so
+# the ts-defgen.js auto-detect pass never sees them. We inject the type
+# declarations here so authors get autocomplete on `Java.type(...)`,
+# `Polyglot.import(...)`, `print(...)`, and friends.
+#
+# Marker comment `// T-4: GraalVM intrinsics begin` keeps the patch idempotent.
+python3 - "$AMBIENT" <<'PY'
+import re, sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+src = path.read_text()
+marker_begin = "    // T-4: GraalVM intrinsics begin"
+marker_end = "    // T-4: GraalVM intrinsics end"
+if marker_begin in src:
+    print(f"post-patches: T-4 no-op on {path.name} (marker present)")
+    sys.exit(0)
+
+block = f'''{marker_begin}
+    // Truffle/GraalVM host-provided globals — exposed to every polyglot
+    // script but invisible to `Object.entries(globalThis)`. See:
+    //   https://www.graalvm.org/jdk25/reference-manual/js/JavaInteroperability/
+    //   https://www.graalvm.org/jdk25/reference-manual/polyglot-programming/
+    interface JavaIntrinsic {{
+        /** Resolve a Java class by FQN. Returns a "type" handle: callable as
+         *  a constructor and indexable for static members. */
+        type<T = any>(className: string): T;
+        /** Convert a Java array (or Iterable) to a JS array. */
+        from<T = unknown>(javaArray: any): T[];
+        /** Convert a JS iterable to a Java array of the given element type. */
+        to(jsArray: ArrayLike<unknown>, javaType?: string | any): any;
+        /** Extend one or more Java classes / interfaces. */
+        extend(...types: any[]): any;
+        /** Call a superclass method on a Java-extended object. */
+        super(obj: any): any;
+        /** Run a callback while holding the intrinsic monitor of `lock`. */
+        synchronized<T>(fn: () => T, lock: any): T;
+        isJavaObject(obj: unknown): boolean;
+        isJavaFunction(obj: unknown): boolean;
+        isScriptObject(obj: unknown): boolean;
+        isScriptFunction(obj: unknown): boolean;
+        isType(obj: unknown): boolean;
+        typeName(type: any): string;
+        asJSONCompatible(obj: any): any;
+    }}
+    const Java: JavaIntrinsic;
+    /** GraalVM polyglot bindings — shared key/value space across languages. */
+    interface PolyglotIntrinsic {{
+        import<T = unknown>(name: string): T;
+        export<T>(name: string, value: T): void;
+        eval<T = unknown>(language: string, source: string): T;
+        evalFile<T = unknown>(language: string, source: string): T;
+    }}
+    const Polyglot: PolyglotIntrinsic;
+    /** Print to stdout with a trailing newline. */
+    function print(...args: unknown[]): void;
+    /** Print to stderr with a trailing newline. */
+    function printErr(...args: unknown[]): void;
+    /** Evaluate JS source from a string, file path, or URL. */
+    function load(source: string | {{ name: string; script: string }}): unknown;
+    /** Like `load`, but evaluates in a fresh global scope. */
+    function loadWithNewGlobal(source: string | {{ name: string; script: string }}, ...args: unknown[]): unknown;
+    /** GraalVM runtime metadata. */
+    const Graal: {{
+        readonly language: string;
+        readonly versionECMAScript: string;
+        readonly versionGraalVM: string;
+        readonly isGraalRuntime: boolean;
+    }};
+    /** Worker-thread API (only when js.worker is enabled). */
+    const Workers: any;
+{marker_end}
+'''
+
+# Insert the block right after the `declare global {` line. Match exactly to
+# avoid touching anything unintended.
+new_src, n = re.subn(
+    r'(^declare global \{\n)',
+    lambda m: m.group(1) + block,
+    src, count=1, flags=re.MULTILINE,
+)
+if n == 0:
+    print(
+        f"post-patches: WARNING T-4 — `declare global {{` not found in {path.name}; "
+        "GraalVM intrinsics not injected",
+        file=sys.stderr,
+    )
+    sys.exit(0)
+
+path.write_text(new_src)
+print(f"post-patches: T-4 injected GraalVM intrinsics into {path.name}")
+PY
+
 echo "post-patches: done ($PKG_ROOT)"
