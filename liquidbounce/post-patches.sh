@@ -103,4 +103,90 @@ if export_new not in path.read_text():
     sys.exit(2)
 PY
 
+# P-02-prime: refine PolyglotScript.registerModule().
+#
+# The Kotlin signature is `registerModule(Map<String, Any>, Consumer<ClientModule>)`
+# but at runtime the callback receives a ScriptModule (a polyglot proxy that
+# wraps ClientModule with script-friendly methods like `bind(...)`,
+# `setting(...)`, etc.), see PolyglotScript.kt line ~219:
+#
+#     val module = ScriptModule(this, moduleObject)
+#     callback.accept(module)
+#
+# There is no static signal for this — the type promotion must be expressed
+# as an overlay. We also narrow the descriptor parameter to the runtime
+# contract { name; category; …extras } so authors get autocomplete on the
+# two required keys.
+python3 - "$PKG_ROOT/types/net/ccbluex/liquidbounce/script/PolyglotScript.d.ts" <<'PY'
+import re, sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.exists():
+    print(f"post-patches: skipping P-02 — {path} not found", file=sys.stderr)
+    sys.exit(0)
+
+src = path.read_text()
+orig = src
+script_module_import = (
+    "import type { ScriptModule } from './bindings/features/ScriptModule.d.ts'"
+)
+register_module_new = (
+    "    registerModule(moduleObject: { name: string; category: string; "
+    "[key: string]: unknown }, callback: (mod: ScriptModule) => void): void;"
+)
+
+# (1) Ensure the ScriptModule import exists. Insert right after the
+#     ClientModule import to keep the block visually grouped.
+if script_module_import not in src:
+    client_module_import = re.search(
+        r"^import type \{ ClientModule \} from '[^']+';?$",
+        src, re.MULTILINE,
+    )
+    if client_module_import:
+        end = client_module_import.end()
+        src = src[:end] + "\n" + script_module_import + src[end:]
+    else:
+        print(
+            "post-patches: WARNING P-02 — no ClientModule import found in "
+            "PolyglotScript.d.ts; ScriptModule import not added",
+            file=sys.stderr,
+        )
+
+# (2) Rewrite the registerModule signature. Match the raw generator output
+#     (Map<String, Object> param + ClientModule callback) and the already-
+#     refined form (idempotent no-op).
+already_refined = register_module_new in src
+if not already_refined:
+    # Tolerate small whitespace variation in the raw signature.
+    raw_pat = re.compile(
+        r"^[ \t]*registerModule\(\s*moduleObject:\s*\{\s*\[key:\s*string\]:\s*Object\s*\},"
+        r"\s*callback:\s*\(\s*param0:\s*ClientModule\s*\)\s*=>\s*void\s*\):\s*void;",
+        re.MULTILINE,
+    )
+    new, n = raw_pat.subn(register_module_new, src)
+    if n:
+        src = new
+    else:
+        # Fall back: any registerModule(...) one-liner.
+        loose = re.compile(r"^[ \t]*registerModule\([^\n]*\):\s*void;", re.MULTILINE)
+        new, n = loose.subn(register_module_new, src)
+        if n:
+            src = new
+
+if src == orig:
+    print(f"post-patches: P-02 no-op on {path.name} (already refined or pattern missing)")
+else:
+    path.write_text(src)
+    print(f"post-patches: refined {path.name} (P-02-prime: registerModule signature)")
+
+# Sanity.
+if register_module_new not in path.read_text():
+    print(
+        f"FAIL: P-02 did not produce the expected registerModule signature in {path}",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+PY
+
 echo "post-patches: done ($PKG_ROOT)"
