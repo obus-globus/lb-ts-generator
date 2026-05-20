@@ -67,3 +67,39 @@ const TypeScriptGenerator   = Java.type('me.ntrrgc.tsGenerator.TypeScriptGenerat
 ## License
 
 Same as upstream: Apache-2.0 / GPL-3.0 (see `LICENSE-*.md`).
+
+## GitHub Actions
+
+Three workflows live in `.github/workflows/`:
+
+| Workflow | Trigger | Purpose |
+| --- | --- | --- |
+| `build.yml` | push / PR / manual | Build the Fabric-mod shadow jar on JDK 21 and upload it as the `ts-generator-mod` artifact. |
+| `regen-raw.yml` | manual only | Build the mod, clone LiquidBounce at the chosen ref, run the client headlessly under `xvfb`, and upload the raw generator output as a single zstd-compressed tarball. **No enhancement patches applied.** |
+| `regen-enhanced.yml` | manual only | Same as `regen-raw`, then runs `patches/apply-enhancements.sh` to apply P-1 (`registerScript` callable) and P-2 (`registerModule` callback typed `ScriptModule`) before packaging the artifact. |
+
+The two regen workflows accept inputs:
+
+- `lb_repo` — defaults to `CCBlueX/LiquidBounce`
+- `lb_ref` — branch / tag / SHA (defaults to `nextgen`)
+- `runclient_timeout` — minutes (default `75`)
+
+A regen run produces ~57k `.d.ts` files (~270 MB uncompressed, ~50 MB
+compressed). Expect roughly 60–90 minutes of wall-clock time on a
+GitHub-hosted `ubuntu-latest` runner — most of it inside Kotlin reflection.
+
+## Enhancement patches
+
+The "enhancement" patches applied by `regen-enhanced.yml` are documented
+in detail in the consumer repo
+(`liquidbounce-helper/docs/47-types-regeneration.md`):
+
+- **P-1** — rewrites `ambient/ambient.d.ts` so `registerScript({...})` is
+  callable (the generator emits a `PolyglotScript$RegisterScript_` binding
+  that has no call signature).
+- **P-2** — rewrites the `registerModule` signature in
+  `types/net/ccbluex/liquidbounce/script/PolyglotScript.d.ts` so the
+  callback parameter is typed `ScriptModule` (which exposes `.on`,
+  `.settings`, etc.) instead of `ClientModule`.
+
+The script is idempotent — running it twice is a no-op.

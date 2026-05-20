@@ -1,0 +1,181 @@
+name: Regen LB types (raw)
+
+# Manually trigger a full LiquidBounce script-api type regeneration using
+# the freshly-built ts-generator mod from this repo. Uploads the raw
+# (no-enhancement) output as a workflow artifact.
+#
+# This mirrors `liquidbounce-helper/tools/regen-types.sh` but on GitHub-
+# hosted runners.
+
+on:
+  workflow_dispatch:
+    inputs:
+      lb_repo:
+        description: 'LiquidBounce repo (owner/name)'
+        required: true
+        default: 'CCBlueX/LiquidBounce'
+      lb_ref:
+        description: 'LiquidBounce ref (branch, tag, or SHA)'
+        required: true
+        default: 'nextgen'
+      runclient_timeout:
+        description: 'runClient timeout in minutes'
+        required: true
+        default: '75'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: regen-${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  regen:
+    name: Regenerate types (no enhancement)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout lb-ts-generator
+        uses: actions/checkout@v4
+        with:
+          path: lb-ts-generator
+
+      - name: Checkout LiquidBounce
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.lb_repo }}
+          ref: ${{ inputs.lb_ref }}
+          path: liquidbounce
+          submodules: recursive
+
+      - name: Record LB commit
+        id: lb_commit
+        run: |
+          cd liquidbounce
+          sha="$(git rev-parse HEAD)"
+          short="$(git rev-parse --short HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short=$short" >> "$GITHUB_OUTPUT"
+          echo "LB pinned at $sha"
+
+      - name: Install xvfb + mesa
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            xvfb mesa-utils libgl1-mesa-dri libglx-mesa0 libegl1 libgbm1 \
+            libxi6 libxcursor1 libxrandr2 libxxf86vm1 libxext6 zstd
+
+      - name: Set up JDK 21 (for ts-generator shadow jar)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Build ts-generator shadow jar
+        run: |
+          cd lb-ts-generator
+          ./gradlew --no-daemon shadowJar
+          ls -lh build/libs/
+
+      - name: Set up JDK 25 (for LiquidBounce runClient)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Stage mod + ts-defgen
+        run: |
+          set -euo pipefail
+          jar="$(find lb-ts-generator/build/libs -name 'ts-generator-*-all.jar' -print -quit)"
+          [ -n "$jar" ] || { echo "no shadow jar" >&2; exit 1; }
+          mkdir -p liquidbounce/run/mods liquidbounce/run/LiquidBounce/scripts
+          # The jar already contains fabric.mod.json (id: ts_generator) — drop
+          # it straight into run/mods/ so Knot loads its classes onto the
+          # runtime classpath.
+          cp "$jar" liquidbounce/run/mods/ts-generator-mod.jar
+          # ts-defgen.js loads the same jar from a known path inside the
+          # scripts dir; keep both copies for compatibility with LB's own
+          # bootstrap.
+          cp "$jar" liquidbounce/run/LiquidBounce/scripts/ts-generator.jar
+          cp lb-ts-generator/liquidbounce/ts-defgen.js liquidbounce/run/LiquidBounce/scripts/ts-defgen.js
+          ls -lh liquidbounce/run/mods/ liquidbounce/run/LiquidBounce/scripts/
+
+      - name: Run client (regen types)
+        env:
+          SCRIPT_TYPEGEN_BUILD: 'true'
+          LB_BROWSER_SKIP: 'true'
+          LB_INTEROP_SKIP: 'true'
+          LIBGL_ALWAYS_SOFTWARE: '1'
+          GALLIUM_DRIVER: 'llvmpipe'
+          MESA_GL_VERSION_OVERRIDE: '4.6'
+          JAVA_TOOL_OPTIONS: >-
+            --add-opens=java.base/java.lang=ALL-UNNAMED
+            --add-opens=java.base/java.lang.invoke=ALL-UNNAMED
+            --add-opens=java.base/java.net=ALL-UNNAMED
+            --add-opens=java.base/java.io=ALL-UNNAMED
+            --add-opens=java.base/jdk.internal.loader=ALL-UNNAMED
+        run: |
+          set -euo pipefail
+          cd liquidbounce
+          # Upstream CCBlueX's own workflow uses `|| exit 0` because mc.close()
+          # at the end of ts-defgen.js may produce a non-zero gradle exit;
+          # we mirror that tolerance and verify the output dir below.
+          timeout "${{ inputs.runclient_timeout }}m" \
+            xvfb-run --auto-servernum \
+              --server-args="-screen 0 1280x720x24 +extension GLX +render -noreset" \
+              ./gradlew runClient -Dfabric.headless=true --no-daemon || \
+            echo "runClient exited non-zero (advisory; verifying output below)"
+
+      - name: Verify output
+        id: verify
+        run: |
+          set -euo pipefail
+          pkg="liquidbounce/run/LiquidBounce/scripts/@ccbluex/liquidbounce-script-api"
+          if [ ! -d "$pkg" ]; then
+            echo "FAIL: $pkg not found" >&2
+            ls -la liquidbounce/run/LiquidBounce/scripts/ || true
+            exit 1
+          fi
+          count=$(find "$pkg" -type f | wc -l)
+          size=$(du -sh "$pkg" | cut -f1)
+          echo "files=$count" >> "$GITHUB_OUTPUT"
+          echo "size=$size" >> "$GITHUB_OUTPUT"
+          echo "Generated $count files / $size"
+          if [ "$count" -lt 10000 ]; then
+            echo "FAIL: expected >10000 files, got $count" >&2
+            exit 1
+          fi
+
+      - name: Stage output for upload
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          mv liquidbounce/run/LiquidBounce/scripts/@ccbluex out/
+          # Single compressed tarball — 57k+ tiny files would otherwise inflate
+          # the artifact zip dramatically.
+          tar --zstd -cf out/script-api-types-raw.tar.zst -C out @ccbluex
+          ls -lh out/script-api-types-raw.tar.zst
+          # Drop the unpacked tree — only keep the tarball.
+          rm -rf out/@ccbluex
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: script-api-types-raw-${{ steps.lb_commit.outputs.short }}
+          path: out/script-api-types-raw.tar.zst
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Summary
+        run: |
+          cat <<EOF >> "$GITHUB_STEP_SUMMARY"
+          ## Regen complete (raw)
+
+          - LiquidBounce: \`${{ inputs.lb_repo }}@${{ steps.lb_commit.outputs.sha }}\`
+          - Files generated: \`${{ steps.verify.outputs.files }}\`
+          - Output size (uncompressed): \`${{ steps.verify.outputs.size }}\`
+          - Enhancement patches: **not applied** (raw generator output)
+
+          Download the \`script-api-types-raw-${{ steps.lb_commit.outputs.short }}\` artifact above and extract with \`tar --zstd -xf script-api-types-raw.tar.zst\`.
+          EOF
