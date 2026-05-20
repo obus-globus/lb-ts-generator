@@ -354,4 +354,49 @@ path.write_text(new_src)
 print(f"post-patches: T-4 injected GraalVM intrinsics into {path.name}")
 PY
 
+# T-5: PolyglotScript.on() literal-string overloads. The Kotlin signature
+# is `on(eventName: String, handler: Runnable)` (which the generator emits
+# as `on(eventName: string, handler: () => void): void`). Only three
+# event names are ever dispatched: "load", "enable", "disable" — see
+# PolyglotScript.kt callGlobalEvent() callers. Adding string-literal
+# overloads gives autocomplete on those names and rejects typos. The
+# generic string fallback is preserved as the last overload so power-users
+# who depend on dynamic event names aren't broken.
+python3 - "$PKG_ROOT/types/net/ccbluex/liquidbounce/script/PolyglotScript.d.ts" <<'PY'
+import re, sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.exists():
+    print(f"post-patches: skipping T-5 — {path} not found", file=sys.stderr)
+    sys.exit(0)
+
+src = path.read_text()
+overload_block_marker = '    on(eventName: "load" | "enable" | "disable", handler: () => void): void;'
+if overload_block_marker in src:
+    print(f"post-patches: T-5 no-op on {path.name} (overload already present)")
+    sys.exit(0)
+
+old_line = re.compile(
+    r'^[ \t]*on\(eventName: string, handler: \(\) => void\): void;[ \t]*$',
+    re.MULTILINE,
+)
+replacement = (
+    f'{overload_block_marker}\n'
+    f'    /** @deprecated Only "load" | "enable" | "disable" are dispatched '
+    f'by PolyglotScript — see `callGlobalEvent` in PolyglotScript.kt. Use the '
+    f'literal-overload above for editor autocomplete. */\n'
+    f'    on(eventName: string, handler: () => void): void;'
+)
+new_src, n = old_line.subn(replacement, src, count=1)
+if n == 0:
+    print(
+        f"post-patches: WARNING T-5 — generic on() signature not found in {path.name}",
+        file=sys.stderr,
+    )
+    sys.exit(0)
+path.write_text(new_src)
+print(f"post-patches: T-5 added on() literal overloads to {path.name}")
+PY
+
 echo "post-patches: done ($PKG_ROOT)"
