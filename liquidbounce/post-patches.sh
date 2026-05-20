@@ -826,4 +826,73 @@ print(
 )
 PY
 
+# ----------------------------------------------------------------------
+# T-10 — strip ScriptModule.on(eventName: string, ...) so the 122 narrowed
+# overloads in augmentations/ScriptModule.augmentation.d.ts can actually
+# take effect. (Resolves Issue #7.)
+#
+# Root cause: ts-generator emits `on(eventName: string, handler: Value):
+# void` directly on `ScriptModule` from the Kotlin source. The augmentation
+# barrel (`augmentations/index.d.ts` → `ScriptModule.augmentation.d.ts`)
+# does load — it `declare module`s the interface and adds 122 narrowed
+# overloads. But TS overload resolution iterates all known signatures and
+# accepts the first match; the generic `(eventName: string, ...)` accepts
+# any string, so typos like `mod.on("attck", ...)` silently typecheck and
+# misfire at runtime.
+#
+# Fix: remove the generic overload. The augmentation's overloads remain
+# the only signatures for `.on(...)`, so:
+#   - `mod.on("attack", e => ...)`  → e: AttackEntityEvent (already worked)
+#   - `mod.on("attck", ...)`        → TS2769: name not assignable (now)
+#
+# The augmentation also covers `"enable" | "disable"` so the lifecycle
+# events still resolve correctly.
+echo "post-patches: applying T-10 (strip ScriptModule.on base overload)..."
+
+python3 - "$PKG_ROOT/types/net/ccbluex/liquidbounce/script/bindings/features/ScriptModule.d.ts" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+target = Path(sys.argv[1])
+if not target.is_file():
+    print(f"post-patches: T-10 skip — {target} not found", file=sys.stderr)
+    sys.exit(0)
+
+text = target.read_text(encoding="utf-8")
+PAT = re.compile(r"^[ \t]*on\(eventName:\s*string,\s*handler:\s*Value\):\s*void;\s*$", re.MULTILINE)
+new_text, n = PAT.subn(
+    "    // T-10: base on() removed; see augmentations/ScriptModule.augmentation.d.ts",
+    text,
+)
+
+if n == 0:
+    print("post-patches: T-10 no-op (no base on() found — augmentation may already be sole signature)")
+elif n == 1:
+    target.write_text(new_text, encoding="utf-8")
+    print("post-patches: T-10 stripped base ScriptModule.on(eventName: string, handler: Value)")
+else:
+    print(f"post-patches: T-10 unexpected — matched {n} times; aborting to avoid corruption", file=sys.stderr)
+    sys.exit(1)
+PY
+
+# ----------------------------------------------------------------------
+# T-#7 augmentation barrel sanity — keep augmentations/index.d.ts
+# loading the ScriptModule augmentation as a side effect. Without this,
+# the 122 narrowed `on(...)` overloads never reach the ambient surface.
+# Idempotent: writes only if missing or empty.
+AUG_INDEX="$PKG_ROOT/augmentations/index.d.ts"
+if [[ -d "$PKG_ROOT/augmentations" ]]; then
+    if [[ ! -s "$AUG_INDEX" ]] || ! grep -q "ScriptModule.augmentation" "$AUG_INDEX"; then
+        cat > "$AUG_INDEX" <<'AUG'
+// Augmentation barrel — side-effect import wires the augmentation files
+// into the ambient module so the typed-event overloads merge with the
+// ScriptModule interface. Keep as side-effect imports (not re-exports);
+// the augmentation files have no values to re-export.
+import './ScriptModule.augmentation';
+AUG
+        echo "post-patches: T-#7 wrote augmentations/index.d.ts"
+    fi
+fi
+
 echo "post-patches: done ($PKG_ROOT)"
