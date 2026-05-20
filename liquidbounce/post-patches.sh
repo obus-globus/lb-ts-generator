@@ -215,10 +215,14 @@ if not types_root.is_dir():
 RESERVED = (
     "break|case|catch|class|const|continue|debugger|default|delete|do|else|"
     "enum|export|extends|false|finally|for|function|if|import|in|instanceof|"
-    "new|null|return|super|switch|this|throw|true|try|typeof|var|void|while|"
+    "new|null|return|super|switch|throw|true|try|typeof|var|void|while|"
     "with|implements|interface|let|package|private|protected|public|static|"
     "yield|await"
 )
+# Note: `this` is intentionally excluded — TypeScript supports a typed
+# `this` parameter in function signatures (`(this: T, ...) => R`) which
+# T-7 relies on, and no real Java/Kotlin parameter is ever named `this`
+# at the bytecode level, so excluding it is also a no-op for raw output.
 
 # Match identifier in parameter position. Three groups:
 #   1: the leading char(s) we want to preserve verbatim (`(`, `,`, `<` or
@@ -498,5 +502,41 @@ else:
         f"factories in {path.name}"
     )
 PY
+
+# -----------------------------------------------------------------------------
+# T-7 — DSL receiver lambda: ValueGroup.curve
+# -----------------------------------------------------------------------------
+# Kotlin signature:
+#   inline fun curve(name: String, block: CurveValue.Builder.() -> Unit): CurveValue
+# Generated TS:
+#   curve(name: string, block: Function1<CurveValue$Builder, void>): CurveValue;
+# Function1 is an interface with an `invoke` method — TS callers can't pass an
+# arrow function. The receiver (`this` inside block) is lost entirely.
+#
+# Refined to a TS function type with `this`-parameter binding so callers can
+# write `group.curve("x", function () { this.tension = 0.5 })`.
+
+VG_FILE="$PKG_ROOT/types/net/ccbluex/liquidbounce/config/types/group/ValueGroup.d.ts"
+if [ -f "$VG_FILE" ]; then
+python3 - "$VG_FILE" <<'PY'
+import sys, re
+from pathlib import Path
+
+path = Path(sys.argv[1])
+src = path.read_text()
+
+raw = "    curve(name: string, block: Function1<CurveValue$Builder, void>): CurveValue;"
+refined = "    curve(name: string, block: (this: CurveValue$Builder) => void): CurveValue;"
+
+if refined in src:
+    print(f"post-patches: T-7 no-op on {path.name} (already refined)")
+elif raw in src:
+    src = src.replace(raw, refined, 1)
+    path.write_text(src)
+    print(f"post-patches: T-7 refined ValueGroup.curve in {path.name}")
+else:
+    print(f"post-patches: T-7 skip — raw curve signature not found in {path.name}")
+PY
+fi
 
 echo "post-patches: done ($PKG_ROOT)"
