@@ -773,4 +773,57 @@ else
     echo "post-patches: T-Doc-Phase-C skipped (manifest or apply script missing)"
 fi
 
+# -----------------------------------------------------------------------------
+# T-9 — kotlin.Any? nullable-suffix bleed (Issue #10)
+# -----------------------------------------------------------------------------
+# ts-generator emits Kotlin's `Any?` (nullable Any) verbatim, including the
+# trailing `?`. In TypeScript this is:
+#   - Invalid in array-element position: `kotlin.Any?[]` -> TS1005.
+#   - Invalid in property-initializer position: `: kotlin.Any?[];` ->
+#     TS1442/TS1144 (parser reads `?` as start of conditional/optional).
+#   - Mostly tolerated in function-return position (parser treats as
+#     conditional-type prefix and bails), but still semantically wrong —
+#     authors get no autocomplete on the returned value.
+#
+# Replace every `kotlin.Any?` (with or without trailing `[]`) with
+# `unknown` (or `unknown[]`), which is the structurally-correct TS
+# representation of "any value, possibly null".
+#
+# Currently produces ~1100 substitutions; brings the tsc out-of-tree
+# diagnostic count from 4 to 0.
+
+python3 - "$PKG_ROOT/types" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+types_root = Path(sys.argv[1])
+if not types_root.is_dir():
+    print(f"post-patches: T-9 skip — {types_root} not a directory", file=sys.stderr)
+    sys.exit(0)
+
+PAT = re.compile(r"\bkotlin\.Any\?(\[\])?")
+
+def repl(m):
+    return "unknown[]" if m.group(1) else "unknown"
+
+total_files = 0
+total_subs = 0
+changed_files = 0
+
+for path in types_root.rglob("*.d.ts"):
+    total_files += 1
+    text = path.read_text(encoding="utf-8")
+    new_text, n = PAT.subn(repl, text)
+    if n:
+        path.write_text(new_text, encoding="utf-8")
+        total_subs += n
+        changed_files += 1
+
+print(
+    f"post-patches: T-9 replaced kotlin.Any? -> unknown — "
+    f"{total_subs} substitutions across {changed_files}/{total_files} files"
+)
+PY
+
 echo "post-patches: done ($PKG_ROOT)"
