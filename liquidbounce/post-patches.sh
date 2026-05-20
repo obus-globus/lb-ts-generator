@@ -399,4 +399,104 @@ path.write_text(new_src)
 print(f"post-patches: T-5 added on() literal overloads to {path.name}")
 PY
 
+# T-6: ScriptSetting factory option-object signatures. Each ScriptSetting
+# method takes a single org.graalvm.polyglot.Value parameter and reads
+# named members off it (name, default, range, suffix, choices, canBeNone).
+# The runtime contract is enforced by Kotlin code (ScriptSetting.kt), not
+# by the static type. Without these overlays, autocomplete shows nothing
+# inside the option object and authors have to read source code to know
+# what keys to pass. We replace each `value: Value` parameter with the
+# named-key object shape required at runtime.
+python3 - "$PKG_ROOT/types/net/ccbluex/liquidbounce/script/bindings/features/ScriptSetting.d.ts" <<'PY'
+import re, sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.exists():
+    print(f"post-patches: skipping T-6 — {path} not found", file=sys.stderr)
+    sys.exit(0)
+
+src = path.read_text()
+orig = src
+
+# (method_name, raw signature suffix, replacement signature with refined
+# parameter shape). Return types match the regenerated form exactly so the
+# diff stays minimal and the rewrite is reversible.
+SIGS = [
+    (
+        "boolean",
+        "boolean(option: { name: string; default: boolean }): Value<boolean>;",
+    ),
+    (
+        "float",
+        "float(option: { name: string; default: number; range: [number, number]; "
+        "suffix?: string }): RangedValue<number>;",
+    ),
+    (
+        "floatRange",
+        "floatRange(option: { name: string; default: [number, number]; "
+        "range: [number, number]; suffix?: string }): "
+        "RangedValue<ClosedFloatingPointRange<number>>;",
+    ),
+    (
+        "int",
+        "int(option: { name: string; default: number; range: [number, number]; "
+        "suffix?: string }): RangedValue<number>;",
+    ),
+    (
+        "intRange",
+        "intRange(option: { name: string; default: [number, number]; "
+        "range: [number, number]; suffix?: string }): "
+        "RangedValue<{ start: number; endInclusive: number; step: number }>;",
+    ),
+    (
+        "key",
+        "key(option: { name: string; default: string }): Value<InputConstants$Key>;",
+    ),
+    (
+        "text",
+        "text(option: { name: string; default: string }): Value<string>;",
+    ),
+    (
+        "textArray",
+        "textArray(option: { name: string; default: string[] }): Value<string[]>;",
+    ),
+    (
+        "choose",
+        "choose<C extends readonly string[]>(option: { name: string; choices: C; "
+        "default: C[number] }): ChoiceListValue<Tagged>;",
+    ),
+    (
+        "multiChoose",
+        "multiChoose<C extends readonly string[]>(option: { name: string; "
+        "choices: C; default?: ReadonlyArray<C[number]>; canBeNone?: boolean }): "
+        "MultiChoiceListValue<Tagged>;",
+    ),
+]
+
+substitutions = 0
+for method, refined in SIGS:
+    indented = "    " + refined
+    if indented in src:
+        continue  # idempotent
+    # Match: `    <method>(value: Value): <return>;` — generated form.
+    raw_pat = re.compile(
+        rf"^[ \t]*{re.escape(method)}\(value: Value\):[^\n]+;[ \t]*$",
+        re.MULTILINE,
+    )
+    new, n = raw_pat.subn(indented, src, count=1)
+    if n:
+        src = new
+        substitutions += 1
+
+if src == orig:
+    print(f"post-patches: T-6 no-op on {path.name} (already refined or pattern missing)")
+else:
+    path.write_text(src)
+    print(
+        f"post-patches: T-6 refined {substitutions}/{len(SIGS)} ScriptSetting "
+        f"factories in {path.name}"
+    )
+PY
+
 echo "post-patches: done ($PKG_ROOT)"
