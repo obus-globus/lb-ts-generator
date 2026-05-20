@@ -38,6 +38,40 @@ const DateTimeFormatter_1 = require("@ccbluex/liquidbounce-script-api/java/time/
 const inDev = LiquidBounce_1.LiquidBounce.IN_DEVELOPMENT;
 // @ts-expect-error
 const globalEntries = Object.entries(globalThis);
+// T-1: Detect classes that implement a SAM (single-abstract-method) functional
+// interface like java.util.function.Function so we can emit them as callable
+// types in ambient.d.ts (otherwise they'd be uncallable class-instance types).
+// Returns the SAM method name (e.g. "apply") or null when the class is not a SAM.
+function detectSamMethod(clazz) {
+    try {
+        if (!clazz || typeof clazz.getInterfaces !== "function") return null;
+        // Known SAM interfaces with single abstract method "apply"
+        const samInterfaces = {
+            "java.util.function.Function": "apply",
+            "kotlin.jvm.functions.Function1": "invoke",
+            "kotlin.jvm.functions.Function0": "invoke",
+            "kotlin.jvm.functions.Function2": "invoke",
+        };
+        const seen = new Set();
+        function walk(c) {
+            if (!c || seen.has(c.getName())) return null;
+            seen.add(c.getName());
+            const ifaces = c.getInterfaces();
+            for (let i = 0; i < ifaces.length; i++) {
+                const n = ifaces[i].getName();
+                if (samInterfaces[n]) return samInterfaces[n];
+                const inherited = walk(ifaces[i]);
+                if (inherited) return inherited;
+            }
+            const sc = c.getSuperclass && c.getSuperclass();
+            if (sc) return walk(sc);
+            return null;
+        }
+        return walk(clazz);
+    } catch (e) {
+        return null;
+    }
+}
 // Function to create a URLClassLoader from a JAR path
 function createClassLoaderFromJar(jarPath) {
     try {
@@ -192,7 +226,16 @@ ${globalEntries
             .filter((entry) => entry[1] != undefined)
             .filter((entry) => !(entry[1] instanceof Class_1.Class))
             .filter((entry) => entry[1].class != undefined)
-            .map((entry) => `    export const ${entry[0]}: ${getName(entry[1].class)}_;`)
+            .map((entry) => {
+                const clazz = entry[1].class;
+                const samMethod = detectSamMethod(clazz);
+                if (samMethod) {
+                    // T-1: emit a callable by plucking the SAM method's type
+                    // via indexed access (e.g. RegisterScript_['apply']).
+                    return `    export const ${entry[0]}: ${getName(clazz)}_[${JSON.stringify(samMethod)}];`;
+                }
+                return `    export const ${entry[0]}: ${getName(clazz)}_;`;
+            })
             .join("\n\n")}
 
 ${javaClasses
