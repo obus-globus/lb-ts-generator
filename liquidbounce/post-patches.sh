@@ -754,4 +754,23 @@ print(
 )
 PY
 
+# -----------------------------------------------------------------------------
+# T-Doc Phase C — automated KDoc → TSDoc injection from
+# tools/kdoc-extractor/manifest.json. Adds TSDoc blocks to all classes and
+# members where KDoc exists in the LiquidBounce source. Skips any
+# declaration that already has a /** … */ block (which preserves the
+# hand-curated Phase A docs).
+#
+# The manifest is committed to git alongside the extractor so this step is
+# fully offline / reproducible.
+
+MANIFEST="$REPO_ROOT/tools/kdoc-extractor/manifest.json"
+APPLY_SCRIPT="$REPO_ROOT/tools/regen/apply-kdoc.py"
+if [ -f "$MANIFEST" ] && [ -f "$APPLY_SCRIPT" ]; then
+    python3 "$APPLY_SCRIPT" "$PKG_ROOT" "$MANIFEST" || \
+        echo "post-patches: T-Doc-Phase-C failed (non-fatal, continuing)"
+else
+    echo "post-patches: T-Doc-Phase-C skipped (manifest or apply script missing)"
+fi
+
 echo "post-patches: done ($PKG_ROOT)"
