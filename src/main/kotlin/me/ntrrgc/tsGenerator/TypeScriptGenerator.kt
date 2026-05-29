@@ -619,11 +619,14 @@ class TypeScriptGenerator(
                 }.filter { !MIXIN_COUNTER_REGEX.containsMatchIn(it.name) }
                 .sortedWith(compareBy({ it.name }, { it.toString() }))
                 .joinToString("") { function ->
-                    // Use the JVM method name (honors @JvmName) — the actual
-                    // runtime member scripts call, not the Kotlin source name
-                    // (e.g. attackEntityJs -> attackEntity). (F5)
-                    val runtimeName = function.javaMethod?.name ?: function.name
-                    val functionName = pipeline.transformFunctionName(runtimeName, function, klass)
+                    // NOTE: we use the Kotlin source name here, NOT the @JvmName
+                    // runtime name. Honoring @JvmName at the generator root is not
+                    // viable (see fix-binding-types.py F5): KFunction.javaMethod is
+                    // null for @JvmName-renamed functions and @JvmName is
+                    // CLASS-retained (invisible to reflection). The lone affected
+                    // binding (attackEntityJs -> attackEntity) is corrected by the
+                    // idempotent fix-binding-types.py post-patch instead.
+                    val functionName = pipeline.transformFunctionName(function.name, function, klass)
                     val returnType = pipeline.transformFunctionReturnType(function.returnType, function, klass)
                     val parameters = function.parameters
                         .drop(1)
