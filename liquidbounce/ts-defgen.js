@@ -138,10 +138,11 @@ function generate(path, packageName) {
         const TsGen = ReflectionUtil.classByName("me.ntrrgc.tsGenerator.TypeScriptGenerator");
         const VoidType = ReflectionUtil.classByName("me.ntrrgc.tsGenerator.VoidType");
         const NULL = VoidType.getEnumConstants()[0];
-        const javaClasses = globalEntries
+        const javaClasses = [...new Map(globalEntries
             .filter((entry) => entry[1] != undefined)
             .map((entry) => (entry[1] instanceof Class_1.Class ? entry[1] : entry[1].class))
-            .filter((entry) => entry != undefined);
+            .filter((entry) => entry != undefined)
+            .map((clazz) => [clazz.name, clazz])).values()]; // dedupe: a class bound under >1 alias must import once (F1)
         const eventEntries = ReflectionUtil.getDeclaredField(EventKt_1.EventKt, "EVENT_NAME_TO_CLASS").entrySet().toArray()
             .map(entry => [entry[0], j2kSafe(entry[1])])
             .filter(entry => entry[1]);
@@ -238,26 +239,19 @@ ${globalEntries
             })
             .join("\n\n")}
 
-${javaClasses
-            .map((clazz) => {
-                var _a, _b;
-                // Check if this class is exported as a constructor (appears in globalEntries as Class)
-                const isExportedAsClass = globalEntries.some(([name, value]) => value instanceof Class_1.Class && value === clazz);
-                if (isExportedAsClass) {
-                    const exportName = (_a = globalEntries.find(([name, value]) => value instanceof Class_1.Class && value === clazz)) === null || _a === void 0 ? void 0 : _a[0];
-                    // Determine if it's a concrete class or interface
-                    // You might need to adjust this logic based on how you distinguish them
-                    const isInterface = ((_b = clazz.isInterface) === null || _b === void 0 ? void 0 : _b.call(clazz)) || false; // Adjust this condition as needed
-                    if (isInterface) {
-                        return `    export const ${exportName}: ${getName(clazz)}_;`;
-                    }
-                    else {
-                        return `    export const ${exportName}: typeof ${getName(clazz)}_;`;
-                    }
+${globalEntries
+            .filter(([name, value]) => value instanceof Class_1.Class)
+            .map(([name, value]) => {
+                var _b;
+                // Iterate global ENTRIES (name-authoritative), so a class bound
+                // under several aliases (e.g. "InteractionHand" AND "Hand") emits
+                // one export const per alias instead of the first alias twice (F1/F6).
+                const isInterface = ((_b = value.isInterface) === null || _b === void 0 ? void 0 : _b.call(value)) || false;
+                if (isInterface) {
+                    return `    export const ${name}: ${getName(value)}_;`;
                 }
-                return null;
+                return `    export const ${name}: typeof ${getName(value)}_;`;
             })
-            .filter((entry) => entry !== null)
             .join("\n\n")}
 
 }

@@ -619,7 +619,11 @@ class TypeScriptGenerator(
                 }.filter { !MIXIN_COUNTER_REGEX.containsMatchIn(it.name) }
                 .sortedWith(compareBy({ it.name }, { it.toString() }))
                 .joinToString("") { function ->
-                    val functionName = pipeline.transformFunctionName(function.name, function, klass)
+                    // Use the JVM method name (honors @JvmName) — the actual
+                    // runtime member scripts call, not the Kotlin source name
+                    // (e.g. attackEntityJs -> attackEntity). (F5)
+                    val runtimeName = function.javaMethod?.name ?: function.name
+                    val functionName = pipeline.transformFunctionName(runtimeName, function, klass)
                     val returnType = pipeline.transformFunctionReturnType(function.returnType, function, klass)
                     val parameters = function.parameters
                         .drop(1)
