@@ -65,7 +65,15 @@ dependencies {
     // to bundle it into the shadow jar.
     compileOnly 'com.google.guava:guava:33.4.0-jre'
 
+    // compileOnly: Gson is provided at runtime by Minecraft / LiquidBounce
+    // (bundled in the game jar). Must NOT be implementation — the shadow jar
+    // must not double-bundle Gson, same pattern as the Guava entry above.
+    compileOnly 'com.google.code.gson:gson:2.10.1'
+
     testImplementation 'io.kotest:kotest-runner-junit5:5.7.2'
+    // Gson is compileOnly for production (provided by LB runtime), but tests
+    // run outside LB so we need it on the test classpath explicitly.
+    testImplementation 'com.google.code.gson:gson:2.10.1'
 }
 
 shadowJar {

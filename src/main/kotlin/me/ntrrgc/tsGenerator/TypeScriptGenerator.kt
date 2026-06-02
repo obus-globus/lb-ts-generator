@@ -100,7 +100,8 @@ class TypeScriptGenerator(
     classTransformers: List<ClassTransformer> = listOf(),
     ignoreSuperclasses: Set<KClass<*>> = setOf(),
     private val intTypeName: String = "number",
-    private val voidType: VoidType = VoidType.NULL
+    private val voidType: VoidType = VoidType.NULL,
+    private val kdocSource: KDocSource? = null
 ) {
 
 
@@ -374,7 +375,31 @@ class TypeScriptGenerator(
 
 
 
-            return "$typeKeyword ${klass.binaryName()}$templateParameters$extendsString{\n" +
+            val classDoc = try {
+                kdocSource?.tsdocForFqn(klass.qualifiedName ?: "", "")
+            } catch (_: Throwable) { null } ?: ""
+
+            // W-#9: for Kotlin enums, emit an override of `name()` that
+            // returns a string-literal union of the enum constants. This
+            // lets script authors discriminate enum values via
+            //   if (e.name() === "LINEAR") { ... }
+            // and have TS narrow the literal correctly — without lying
+            // about the runtime shape (Kotlin enums are Java enum objects
+            // at runtime, not strings, so we keep the `class X extends
+            // Enum<X>` form intact). See audit W9 + W19.
+            val enumNameOverride = if (klass.java.isEnum) {
+                try {
+                    val constants = klass.java.enumConstants
+                        ?.mapNotNull { (it as? Enum<*>)?.name }
+                        ?.takeIf { it.isNotEmpty() }
+                    constants?.let { names ->
+                        val union = names.joinToString(" | ") { "\"$it\"" }
+                        "    name(): $union;\n"
+                    } ?: ""
+                } catch (_: Throwable) { "" }
+            } else ""
+
+            return classDoc + "$typeKeyword ${klass.binaryName()}$templateParameters$extendsString{\n" +
                     (if (klass.java.isInterface) "" else
                         staticFieldsOf(klass) + staticMethodsOf(
                             klass,
@@ -384,6 +409,7 @@ class TypeScriptGenerator(
                     constructorsOf(klass) +
                     propertiesOf(klass) +
                     functionsOf(klass, interfaceSupertypes, klass.typeParameters) +
+                    enumNameOverride +
                     "}"
         }
 
@@ -431,6 +457,7 @@ class TypeScriptGenerator(
         private fun staticFieldsOf(klass: KClass<*>): String = try {
             klass.java.fields
                 .filter { Modifier.isStatic(it.modifiers) }
+                .filter { !SYNTHETIC_MEMBER_REGEX.matches(it.name) }
                 .sortedWith(compareBy({ it.name }, { it.toGenericString() }))
                 .joinToString("") { field ->
                     val fieldName = field.name
@@ -442,7 +469,10 @@ class TypeScriptGenerator(
                         else -> ""
                     }
 
-                    "    static $visibility$fieldName: ${formatKType(fieldType).formatWithoutParenthesis()};\n"
+                    val fieldDoc = try {
+                        kdocSource?.tsdocForFqn("${klass.qualifiedName}.${fieldName}", "    ")
+                    } catch (_: Throwable) { null } ?: ""
+                    (fieldDoc + "    static $visibility$fieldName: ${formatKType(fieldType).formatWithoutParenthesis()};\n")
                         .commentIfInvalid()
                 }
         } catch (exception: kotlin.reflect.jvm.internal.KotlinReflectionInternalError) {
@@ -496,6 +526,7 @@ class TypeScriptGenerator(
 
                 .filter { Modifier.isStatic(it.modifiers) }
                 .filter { !MIXIN_COUNTER_REGEX.containsMatchIn(it.name) }
+                .filter { !SYNTHETIC_MEMBER_REGEX.matches(it.name) }
                 .sortedWith(compareBy({ it.name }, { it.toGenericString() }))
                 .joinToString("") { method ->
                     val methodName = method.name
@@ -531,7 +562,10 @@ class TypeScriptGenerator(
                         formatTypeParameters(it)
                     }
 
-                    "    static $visibility$methodName$typeParamsString($parameters): ${formatKType(returnType).formatWithoutParenthesis()};\n"
+                    val methodDoc = try {
+                        kdocSource?.tsdocForFqn("${klass.qualifiedName}.${methodName}", "    ")
+                    } catch (_: Throwable) { null } ?: ""
+                    (methodDoc + "    static $visibility$methodName$typeParamsString($parameters): ${formatKType(returnType).formatWithoutParenthesis()};\n")
                         .commentIfInvalid()
                 }
         } catch (exception: kotlin.reflect.jvm.internal.KotlinReflectionInternalError) {
@@ -563,13 +597,21 @@ class TypeScriptGenerator(
                             "${param.name}: ${formatKType(paramType).formatWithoutParenthesis()}"
                         }
                     val visibility = when (constructor.visibility) {
-                        KVisibility.PRIVATE -> "// private "
+                        // W-#14: emit real TS `private constructor(...)` instead of
+                        // a `// private constructor(...)` comment. The comment form
+                        // is invisible to tsc — emitting the real modifier prevents
+                        // `new Foo()` at the call site for private-constructor types
+                        // (e.g. utility classes, sealed-class instances).
+                        KVisibility.PRIVATE -> "private "
                         KVisibility.PROTECTED -> "protected "
                         KVisibility.PUBLIC -> ""
                         KVisibility.INTERNAL -> ""
                         else -> ""
                     }
-                    "    ${visibility}constructor($parameters)\n"
+                    val ctorDoc = try {
+                        kdocSource?.tsdocForFqn("${klass.qualifiedName}.<init>", "    ")
+                    } catch (_: Throwable) { null } ?: ""
+                    (ctorDoc + "    ${visibility}constructor($parameters)\n")
                         .commentIfInvalid()
                 }
             } catch (e: Throwable) {
@@ -600,7 +642,9 @@ class TypeScriptGenerator(
             klass: KClass<*>,
             interfaceSupertypes: List<KType>,
             typeParameters: List<KTypeParameter>
-        ): String = try {
+        ): String {
+            val emittedFunctionFqns = mutableSetOf<String>()
+            return try {
             (klass.declaredMemberFunctions.asSequence()
                     + interfaceSupertypes.flatMap {
                 if (it.classifier is KClass<*>)
@@ -617,15 +661,9 @@ class TypeScriptGenerator(
                 .let { functionsList ->
                     pipeline.transformFunctionList(functionsList.toList(), klass)
                 }.filter { !MIXIN_COUNTER_REGEX.containsMatchIn(it.name) }
+                .filter { !SYNTHETIC_MEMBER_REGEX.matches(it.name) }
                 .sortedWith(compareBy({ it.name }, { it.toString() }))
                 .joinToString("") { function ->
-                    // NOTE: we use the Kotlin source name here, NOT the @JvmName
-                    // runtime name. Honoring @JvmName at the generator root is not
-                    // viable (see fix-binding-types.py F5): KFunction.javaMethod is
-                    // null for @JvmName-renamed functions and @JvmName is
-                    // CLASS-retained (invisible to reflection). The lone affected
-                    // binding (attackEntityJs -> attackEntity) is corrected by the
-                    // idempotent fix-binding-types.py post-patch instead.
                     val functionName = pipeline.transformFunctionName(function.name, function, klass)
                     val returnType = pipeline.transformFunctionReturnType(function.returnType, function, klass)
                     val parameters = function.parameters
@@ -658,26 +696,34 @@ class TypeScriptGenerator(
 
                     val typeParamString = formatTypeParameters(typeParamsNotOfClass)
 
-                    "    $visibility$functionName$typeParamString($parameters): $formattedReturnType;\n"
+                    val functionDoc = if (emittedFunctionFqns.add("${klass.qualifiedName}.${functionName}")) {
+                        try {
+                            kdocSource?.tsdocForFqn("${klass.qualifiedName}.${functionName}", "    ")
+                        } catch (_: Throwable) { null } ?: ""
+                    } else ""
+
+                    (functionDoc + "    $visibility$functionName$typeParamString($parameters): $formattedReturnType;\n")
                         .commentIfInvalid()
                 }
-        } catch (exception: kotlin.reflect.jvm.internal.KotlinReflectionInternalError) {
-            print(exception.toString())
-            ""
-        } catch (exception: NoClassDefFoundError) {
-            print("Missing dependency: ${exception.message}")
-            "" // Return empty string when dependency is missing
-        } catch (exception: IllegalStateException) {
-            print("Likely unable to infer accessibility: ${exception.message}")
-            ""
-        } catch (exception: Exception) {
-            println("Other exceptions happend ${exception.message}")
-            ""
+            } catch (exception: kotlin.reflect.jvm.internal.KotlinReflectionInternalError) {
+                print(exception.toString())
+                ""
+            } catch (exception: NoClassDefFoundError) {
+                print("Missing dependency: ${exception.message}")
+                "" // Return empty string when dependency is missing
+            } catch (exception: IllegalStateException) {
+                print("Likely unable to infer accessibility: ${exception.message}")
+                ""
+            } catch (exception: Exception) {
+                println("Other exceptions happend ${exception.message}")
+                ""
+            }
         }
 
 
         private fun propertiesOf(klass: KClass<*>): String = try {
             klass.declaredMemberProperties
+                .filter { !SYNTHETIC_MEMBER_REGEX.matches(it.name) }
                 .let { propertyList ->
                     pipeline.transformPropertyList(propertyList.toList(), klass)
                 }.sortedWith(compareBy({ it.name }, { it.returnType.toString() }))
@@ -720,14 +766,18 @@ class TypeScriptGenerator(
 
 
                             // Generate as a readonly property if it has a private setter
+                            val propFqn = "${klass.qualifiedName}.${property.name}"
+                            val propDoc = try {
+                                kdocSource?.tsdocForFqn(propFqn, "    ")
+                            } catch (_: Throwable) { null } ?: ""
                             if (isReadOnly) {
                                 add(
-                                    "    readonly ${transformedPropertyName}: $formattedPropertyType;\n"
+                                    (propDoc + "    readonly ${transformedPropertyName}: $formattedPropertyType;\n")
                                         .commentIfInvalid()
                                 )
                             } else {
                                 add(
-                                    "    ${transformedPropertyName}: $formattedPropertyType;\n".commentIfInvalid()
+                                    (propDoc + "    ${transformedPropertyName}: $formattedPropertyType;\n").commentIfInvalid()
                                 )
                             }
                         } else {
@@ -739,8 +789,11 @@ class TypeScriptGenerator(
                                     pipeline.transformPropertyName(property.name, property, klass)
                                 val visibility =
                                     if (Modifier.isPublic(javaField.modifiers)) "" else "// private "
+                                val fieldDoc = try {
+                                    kdocSource?.tsdocForFqn("${klass.qualifiedName}.${property.name}", "    ")
+                                } catch (_: Throwable) { null } ?: ""
                                 add(
-                                    "    ${visibility}${transformedFieldName}: $formattedPropertyType;\n"
+                                    (fieldDoc + "    ${visibility}${transformedFieldName}: $formattedPropertyType;\n")
                                         .commentIfInvalid()
                                 )
                             }
@@ -983,6 +1036,22 @@ class TypeScriptGenerator(
         //   - Prefix:  md3d0a70$plugin$target        → counter at start before first dollar sign
         // Filter either format; both are non-deterministic across JVM runs.
         private val MIXIN_COUNTER_REGEX = Regex("""(^[a-z]{1,3}[0-9a-f]{4,8}\$|\$([a-z]{1,3}[0-9a-f]{3,4}|[0-9a-f]{6})\$)""")
+
+        // W-#10: Kotlin compiler synthetic members. These appear in declaredMember*
+        // reflection but exist purely for compiler-internal bookkeeping — emitting
+        // them as part of the public TypeScript surface is noise that pollutes
+        // autocomplete (e.g. `ClientModule.d.ts`: 33/131 synthetic members).
+        //
+        //   access${name}$jd / access${name}$cp / access${name}      — companion-class accessors
+        //   {name}$default                                            — default-args bridge
+        //   {name}$annotations                                        — synthetic annotation holder
+        //   ${prefix}$inlined${suffix}                                 — inline-function lambda capture
+        //
+        // Keep tight: only filter names that match the recognised compiler-synthetic
+        // shape, not arbitrary names that happen to contain `$`.
+        private val SYNTHETIC_MEMBER_REGEX = Regex(
+            "^(access[\$].*|.*[\$]default|.*[\$]annotations|.*[\$]inlined[\$].*)$"
+        )
 
         fun isJavaBeanProperty(kProperty: KProperty<*>, klass: KClass<*>): Boolean {
             val beanInfo = Introspector.getBeanInfo(klass.java)

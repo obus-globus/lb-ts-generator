@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 2,
+  "entries": {
+    "net.ccbluex.liquidbounce.LiquidBounce": {
+      "doc": "The LiquidBounce client entry point.\n\nFixture manifest for KDocSourceTest so the standalone repo's tests are\nself-contained; the real manifest (tools/kdoc-extractor/manifest.json) is\npreferred when present.",
+      "kind": "class",
+      "source": { "file": "LiquidBounce.kt", "line": 1 }
+    }
+  }
+}
