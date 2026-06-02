@@ -57,8 +57,21 @@ test {
 
 
 dependencies {
-    implementation "org.jetbrains.kotlin:kotlin-stdlib:$kotlin_version"
-    implementation "org.jetbrains.kotlin:kotlin-reflect:$kotlin_version"
+    // compileOnly (NOT implementation): kotlin-stdlib + kotlin-reflect are provided
+    // at runtime by LiquidBounce's fabric-language-kotlin (currently Kotlin 2.3.10).
+    // Bundling our own (older) copy into the shadow jar makes Knot load TWO Kotlin
+    // runtimes: LB's code is compiled against 2.3.x and references newer reflect API
+    // (e.g. `KParameter.Kind.CONTEXT`, added in Kotlin 2.2) that the bundled 2.0.0
+    // `KParameter$Kind` lacks → `NoSuchFieldError` the instant ts-defgen reflects.
+    // We compile against 2.0.0 (the build's compiler) but ship none of it; LB's
+    // newer-but-backward-compatible Kotlin runs it. Same pattern as Guava/Gson below.
+    // (kotlin.stdlib.default.dependency=false in gradle.properties stops the Kotlin
+    //  plugin from re-adding stdlib as a bundled implementation dep.)
+    compileOnly "org.jetbrains.kotlin:kotlin-stdlib:$kotlin_version"
+    compileOnly "org.jetbrains.kotlin:kotlin-reflect:$kotlin_version"
+    // Tests run outside LB (plain JVM) — they need Kotlin on the test classpath.
+    testImplementation "org.jetbrains.kotlin:kotlin-stdlib:$kotlin_version"
+    testImplementation "org.jetbrains.kotlin:kotlin-reflect:$kotlin_version"
 
     // compileOnly: Guava is provided at runtime by LiquidBounce / Minecraft
     // (we run inside the Knot classloader as a Fabric mod), so we don't want
