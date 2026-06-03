@@ -116,6 +116,19 @@ class TypeScriptGenerator(
 
         val dependentTypes = mutableSetOf<KClass<*>>()
 
+        // W12b: when two dependent types share a simple name (e.g. LB's
+        // config/types/Value and org.graalvm.polyglot.Value), importing both as
+        // `Value` is a TS2300 duplicate identifier. This maps the losing
+        // type(s) to a disambiguated alias used at both the import and every
+        // reference site (see tsNameFor / the two-pass in init).
+        val typeAliases = mutableMapOf<KClass<*>, String>()
+
+        /** The TS name to reference [kClass] by in this module — its alias if
+         * it collided with another import (or this class's own name), else its
+         * simple binary name. */
+        private fun tsNameFor(kClass: KClass<*>): String =
+            typeAliases[kClass] ?: kClass.binaryName()
+
         var definition: String
 
         val moduleText: String by lazy {
@@ -127,7 +140,10 @@ class TypeScriptGenerator(
                 val upLevels = "../".repeat(depth)
                 val downPath = importPath.removePrefix("/")
 
-                "import type { ${it.binaryName()} } from '$upLevels$downPath'"
+                val name = it.binaryName()
+                val alias = typeAliases[it]
+                val imported = if (alias != null) "$name as $alias" else name
+                "import type { $imported } from '$upLevels$downPath'"
             } + "export " + definition
         }
 
@@ -136,6 +152,28 @@ class TypeScriptGenerator(
             path = getFilePathForClassWithoutExtension(klass)
 
             definition = generateDefinition()
+
+            // W12b: resolve same-simple-name collisions among the dependent
+            // types (and against this class's own name) by aliasing the losing
+            // ones, then regenerate so both imports and references use the
+            // disambiguated names. Only collision files pay the second pass.
+            val used = mutableSetOf(klass.binaryName())
+            dependentTypes.sortedBy { it.qualifiedName ?: it.binaryName() }.forEach { dep ->
+                val name = dep.binaryName()
+                if (name in used) {
+                    var n = 2
+                    var alias = "${name}_$n"
+                    while (alias in used) { n++; alias = "${name}_$n" }
+                    typeAliases[dep] = alias
+                    used += alias
+                } else {
+                    used += name
+                }
+            }
+            if (typeAliases.isNotEmpty()) {
+                dependentTypes.clear()
+                definition = generateDefinition()
+            }
         }
 
         private fun getFilePathForClassWithoutExtension(klass: KClass<*>): String {
@@ -207,7 +245,7 @@ class TypeScriptGenerator(
                                 // parameterised singleton types encountered in the wild.
                                 // Guard with try-catch: JVM-module-private objects (e.g. coroutines
                                 // internal markers) throw IllegalAccessException on objectInstance.
-                                classifier.binaryName()
+                                tsNameFor(classifier)
                             else if (Iterable::class.java.isAssignableFrom(classifier.java)
                                 || classifier.javaObjectType.isArray
                             )
@@ -272,7 +310,7 @@ class TypeScriptGenerator(
 
         private fun nonPrimitiveFromKType(kType: KType): String {
             val kClass = kType.classifier as KClass<*>
-            val binaryName = kClass.binaryName()
+            val binaryName = tsNameFor(kClass)
 
             // If the counts don't match, this might indicate a specialized type
             // This is actually infuriating and fucking frustrating that Kotlin does not fucking
