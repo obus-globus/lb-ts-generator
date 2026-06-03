@@ -158,7 +158,18 @@ class TypeScriptGenerator(
             transformFunctionalInterface: Boolean = true
         ): TypeScriptType {
             val classifier = kType.classifier
-            if (classifier is KClass<*>) {
+
+            // Kotlin function types carry their parameter/return types in
+            // kType.arguments — emit a real TS arrow `(param0: A, param1: B) => R`
+            // instead of the nominal `FunctionN<...>` (or `UNKNOWN` for the
+            // null-classifier suspend function types). This recovers type
+            // information reflection already has; without it `(T) -> Unit`
+            // surfaced as `Function1<T, void>` and `suspend (T) -> Unit` as
+            // `UNKNOWN`. Done before the KClass branch so the function classifier
+            // is not added to dependentTypes (no spurious FunctionN import).
+            val functionArrow = kotlinFunctionArrow(kType)
+
+            if (functionArrow == null && classifier is KClass<*>) {
                 val existingMapping = predefinedMappings[classifier]
                     ?: predefinedMappingsByName[classifier.qualifiedName]
                 if (existingMapping != null) {
@@ -177,7 +188,8 @@ class TypeScriptGenerator(
             }
 
             val classifierTsType =
-                if (classifier is KClass<*>) {
+                functionArrow
+                ?: if (classifier is KClass<*>) {
 
                     val javaClass = classifier.java
 
@@ -216,6 +228,44 @@ class TypeScriptGenerator(
 
             // When in a type constraint, we shouldn't add the nullable union type
             return TypeScriptType.single(classifierTsType, kType.isMarkedNullable && !isInTypeConstraint, voidType)
+        }
+
+        /**
+         * If [kType] is a Kotlin function type, render it as a TypeScript arrow
+         * `(param0: A, param1: B) => R`; otherwise return null.
+         *
+         * Two shapes reach us:
+         *  - Ordinary function types (`(A) -> B`, `Function2<A, B, R>`): the
+         *    classifier is the arity-specific `kotlin.FunctionN` class and the
+         *    parameter/return types are in `kType.arguments` (last = return).
+         *  - Suspend function types (`suspend (A) -> R`): kotlin-reflect reports
+         *    a `null` classifier, but the arguments are still present. We detect
+         *    these via the arguments plus a cheap `toString()` shape check (used
+         *    only for detection — the types themselves still come from the
+         *    structured `arguments`, never from string parsing).
+         */
+        private fun kotlinFunctionArrow(kType: KType): String? {
+            val classifier = kType.classifier
+            val isFunctionType = when (classifier) {
+                is KClass<*> ->
+                    classifier.qualifiedName?.let { FUNCTION_CLASS_NAME.matches(it) } == true
+                null -> kType.arguments.isNotEmpty() && kType.toString().let {
+                    it.startsWith("(") || it.startsWith("suspend (")
+                }
+                else -> false
+            }
+            if (!isFunctionType) return null
+
+            val args = kType.arguments
+            if (args.isEmpty()) return null
+
+            val params = args.dropLast(1).mapIndexed { index, arg ->
+                "param$index: ${formatKType(arg.type ?: KotlinAnyOrNull).formatWithoutParenthesis()}"
+            }.joinToString(", ")
+            val returnType = args.last().type
+                ?.let { formatKType(it).formatWithoutParenthesis() }
+                ?: "any"
+            return "($params) => $returnType"
         }
 
 
@@ -1029,6 +1079,9 @@ class TypeScriptGenerator(
     companion object {
         private val KotlinAnyOrNull = Any::class.createType(nullable = true)
         private val KotlinNotNull = Any::class.createType(nullable = false)
+        // Matches kotlin.Function0 .. kotlin.Function22 (the arity-specific
+        // function-type classes kotlin-reflect reports as the classifier).
+        private val FUNCTION_CLASS_NAME = Regex("""kotlin\.Function\d+""")
 
         // Mixin-injected synthetic methods have non-deterministic counter segments in their names.
         // Two formats observed:
