@@ -40,6 +40,7 @@ import java.lang.reflect.Type
 import kotlin.reflect.*
 import kotlin.reflect.full.createType
 import kotlin.reflect.full.declaredMemberFunctions
+import kotlin.reflect.full.memberFunctions
 import kotlin.reflect.full.declaredMemberProperties
 import kotlin.reflect.jvm.javaField
 import kotlin.reflect.jvm.javaGetter
@@ -695,7 +696,28 @@ class TypeScriptGenerator(
         ): String {
             val emittedFunctionFqns = mutableSetOf<String>()
             return try {
-            (klass.declaredMemberFunctions.asSequence()
+            val declaredFns = klass.declaredMemberFunctions.toList()
+
+            // W19: a subclass that redeclares (overrides) one overload of a
+            // method shadows the parent's other overloads in TypeScript — a
+            // declared `foo(int)` hides an inherited `foo(string)`, making the
+            // subclass non-assignable to the parent (TS2416) and dropping the
+            // sibling overload at call sites. Re-emit the inherited overloads of
+            // any redeclared name so the subclass keeps the full signature set.
+            val declaredNames = declaredFns.mapTo(mutableSetOf()) { it.name }
+            val coveredSigs = declaredFns.mapTo(mutableSetOf()) { overloadSignature(it) }
+            val inheritedOverloads = try {
+                klass.memberFunctions.filter {
+                    it.name in declaredNames
+                        && !it.isAbstract
+                        && overloadSignature(it) !in coveredSigs
+                }
+            } catch (_: Throwable) {
+                emptyList<KFunction<*>>()
+            }
+
+            (declaredFns.asSequence()
+                    + inheritedOverloads.asSequence()
                     + interfaceSupertypes.flatMap {
                 if (it.classifier is KClass<*>)
                     (it.classifier as KClass<*>)
@@ -1079,6 +1101,11 @@ class TypeScriptGenerator(
     companion object {
         private val KotlinAnyOrNull = Any::class.createType(nullable = true)
         private val KotlinNotNull = Any::class.createType(nullable = false)
+
+        /** Overload identity: name + value-parameter types (drops the receiver).
+         * Used by W19 to tell an override from a distinct sibling overload. */
+        private fun overloadSignature(f: KFunction<*>): String =
+            f.name + "(" + f.parameters.drop(1).joinToString(",") { it.type.toString() } + ")"
         // Matches kotlin.Function0 .. kotlin.Function22 (the arity-specific
         // function-type classes kotlin-reflect reports as the classifier).
         private val FUNCTION_CLASS_NAME = Regex("""kotlin\.Function\d+""")
