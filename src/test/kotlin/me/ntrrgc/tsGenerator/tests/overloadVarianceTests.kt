@@ -13,6 +13,14 @@ class OverloadChild : OverloadParent() {
     override fun foo(a: Int): Int = a + 1
 }
 
+@Suppress("unused")
+open class CollapseOverloads {
+    // Int and Long both render as `int` in TS — the two overloads collapse to
+    // an identical rendered line and must be de-duplicated.
+    open fun bar(a: Int): String = ""
+    open fun bar(a: Long): String = ""
+}
+
 private val OBJ = """
     class Object{
         constructor()
@@ -42,6 +50,20 @@ class OverloadVarianceTests : StringSpec({
         foo(a: string): string;
     }
     """,
+            ),
+            any = OBJ,
+        )
+    }
+
+    "overloads that collapse to the same rendered TS signature are de-duplicated" {
+        assertGeneratedCode(
+            CollapseOverloads::class, setOf(
+                """
+    class CollapseOverloads extends Object {
+        constructor()
+        bar(a: int): string;
+    }
+    """
             ),
             any = OBJ,
         )

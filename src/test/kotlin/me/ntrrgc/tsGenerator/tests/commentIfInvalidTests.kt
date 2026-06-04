@@ -31,4 +31,17 @@ class CommentIfInvalidTests : StringSpec({
         out.endsWith("\n") shouldBe true
         (out + "}").endsWith("\n}") shouldBe true
     }
+
+    "a hyphen in the leading TSDoc does NOT comment out a valid declaration" {
+        // KDoc legitimately contains hyphens (prose, `* - bullet` lists). Only
+        // the declaration's name can carry an invalid '-'.
+        val input = "    /**\n     * a well-known value\n     * - a bullet\n     */\n    getConfig(): string;\n"
+        input.commentIfInvalid() shouldBe input  // unchanged
+
+        // ... but a mangled name in the declaration still triggers, even with a
+        // hyphenated doc above it.
+        val mangled = "    /**\n     * - note\n     */\n    box-impl(x: int): string;\n"
+        mangled.commentIfInvalid().split("\n").filter { it.isNotBlank() }
+            .all { it.startsWith("//") } shouldBe true
+    }
 })

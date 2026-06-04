@@ -19,7 +19,11 @@ fun KClass<*>.binaryName(): String {
  * token and produced a `TS1005` parse error.)
  */
 fun String.commentIfInvalid(): String {
-    if (!this.contains('-')) return this
+    // Only the DECLARATION can carry an invalid '-' (a JVM @JvmName-mangled
+    // member name); a leading TSDoc block legitimately contains hyphens (prose,
+    // `* - bullet` lists), so test only the part after the last doc block.
+    val declStart = this.lastIndexOf("*/\n").let { if (it >= 0) it + 3 else 0 }
+    if (!this.substring(declStart).contains('-')) return this
     val hadTrailingNewline = this.endsWith("\n")
     val commented = this.trimEnd('\n')
         .split("\n")

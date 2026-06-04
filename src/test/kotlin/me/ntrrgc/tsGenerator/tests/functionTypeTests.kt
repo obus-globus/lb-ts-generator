@@ -16,6 +16,11 @@ class GenericFnTypes<T>(
     val consume: (T) -> Unit
 )
 
+@Suppress("unused")
+class NullableFnType(
+    val onCancellation: ((Int) -> Unit)?
+)
+
 private val OBJECT = """
     class Object{
         constructor()
@@ -54,6 +59,20 @@ class FunctionTypeTests : StringSpec({
     class GenericFnTypes<T extends Object | number | string | boolean> extends Object {
         constructor(consume: (param0: T) => void)
         readonly consume: (param0: T) => void;
+    }
+    """
+            ),
+            any = OBJECT,
+        )
+    }
+
+    "a nullable function type parenthesizes the arrow before | null" {
+        assertGeneratedCode(
+            NullableFnType::class, setOf(
+                """
+    class NullableFnType extends Object {
+        constructor(onCancellation: ((param0: int) => void) | null)
+        readonly onCancellation: ((param0: int) => void) | null;
     }
     """
             ),

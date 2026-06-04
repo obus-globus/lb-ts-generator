@@ -226,8 +226,15 @@ class TypeScriptGenerator(
                     dependentTypes.add(classifier)
             }
 
+            val nullable = kType.isMarkedNullable && !isInTypeConstraint
+
+            // A nullable function type must parenthesize the arrow before the
+            // `| null` union: `((x: A) => B) | null`, NOT `(x: A) => B | null`
+            // (which TS reads as a non-null function returning `B | null`).
+            val arrowType = functionArrow?.let { if (nullable) "($it)" else it }
+
             val classifierTsType =
-                functionArrow
+                arrowType
                 ?: if (classifier is KClass<*>) {
 
                     val javaClass = classifier.java
@@ -266,7 +273,7 @@ class TypeScriptGenerator(
                     "UNKNOWN" // giving up
 
             // When in a type constraint, we shouldn't add the nullable union type
-            return TypeScriptType.single(classifierTsType, kType.isMarkedNullable && !isInTypeConstraint, voidType)
+            return TypeScriptType.single(classifierTsType, nullable, voidType)
         }
 
         /**
@@ -733,6 +740,10 @@ class TypeScriptGenerator(
             typeParameters: List<KTypeParameter>
         ): String {
             val emittedFunctionFqns = mutableSetOf<String>()
+            // W19 can re-emit an inherited overload that renders identically to a
+            // declared one once distinct Kotlin types collapse to the same TS
+            // type (Int/Long -> int). Dedup by the rendered signature line.
+            val emittedSignatures = mutableSetOf<String>()
             return try {
             val declaredFns = klass.declaredMemberFunctions.toList()
 
@@ -806,14 +817,19 @@ class TypeScriptGenerator(
 
                     val typeParamString = formatTypeParameters(typeParamsNotOfClass)
 
-                    val functionDoc = if (emittedFunctionFqns.add("${klass.qualifiedName}.${functionName}")) {
-                        try {
-                            kdocSource?.tsdocForFqn("${klass.qualifiedName}.${functionName}", "    ")
-                        } catch (_: Throwable) { null } ?: ""
-                    } else ""
+                    val signatureLine = "    $visibility$functionName$typeParamString($parameters): $formattedReturnType;"
+                    if (!emittedSignatures.add(signatureLine)) {
+                        // Identical rendered overload already emitted (W19 dedup).
+                        ""
+                    } else {
+                        val functionDoc = if (emittedFunctionFqns.add("${klass.qualifiedName}.${functionName}")) {
+                            try {
+                                kdocSource?.tsdocForFqn("${klass.qualifiedName}.${functionName}", "    ")
+                            } catch (_: Throwable) { null } ?: ""
+                        } else ""
 
-                    (functionDoc + "    $visibility$functionName$typeParamString($parameters): $formattedReturnType;\n")
-                        .commentIfInvalid()
+                        (functionDoc + signatureLine + "\n").commentIfInvalid()
+                    }
                 }
             } catch (exception: kotlin.reflect.jvm.internal.KotlinReflectionInternalError) {
                 print(exception.toString())
@@ -839,10 +855,11 @@ class TypeScriptGenerator(
                 }.sortedWith(compareBy({ it.name }, { it.returnType.toString() }))
                 .flatMap { property ->
                     val propertyType = pipeline.transformPropertyType(property.returnType, property, klass)
-                    val formattedPropertyType = if (isFunctionType(property.returnType.javaType))
-                        formatPropertyFunctionType(propertyType)
-                    else
-                        formatKType(propertyType).formatWithoutParenthesis()
+                    // formatKType now renders function types as arrows (via
+                    // kotlinFunctionArrow) AND handles nullability correctly, so
+                    // properties go through the same path as params — no separate
+                    // formatPropertyFunctionType (which dropped `| null`).
+                    val formattedPropertyType = formatKType(propertyType).formatWithoutParenthesis()
 
                     buildList {
                         // Handle Java Bean properties first
