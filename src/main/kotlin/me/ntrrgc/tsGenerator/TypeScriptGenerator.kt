@@ -240,7 +240,11 @@ class TypeScriptGenerator(
                     val javaClass = classifier.java
 
                     if (isFunctionalInterface(javaClass) && transformFunctionalInterface) {
-                        formatFunctionalInterfaceType(javaClass, kType)
+                        // Same nullable-arrow precedence guard as kotlinFunctionArrow:
+                        // a nullable Java functional interface (`Runnable?`, `Consumer<T>?`)
+                        // must be `((…) => R) | null`, not `(…) => R | null`.
+                        val arrow = formatFunctionalInterfaceType(javaClass, kType)
+                        if (nullable) "($arrow)" else arrow
                     } else {
                         predefinedMappings.getOrDefault(
                             classifier,

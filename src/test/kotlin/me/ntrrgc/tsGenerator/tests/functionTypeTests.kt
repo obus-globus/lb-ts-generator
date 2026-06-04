@@ -21,6 +21,11 @@ class NullableFnType(
     val onCancellation: ((Int) -> Unit)?
 )
 
+@Suppress("unused")
+class NullableJavaFnType(
+    val onCancellation: Runnable?
+)
+
 private val OBJECT = """
     class Object{
         constructor()
@@ -75,6 +80,25 @@ class FunctionTypeTests : StringSpec({
         readonly onCancellation: ((param0: int) => void) | null;
     }
     """
+            ),
+            any = OBJECT,
+        )
+    }
+
+    "a nullable Java functional interface also parenthesizes before | null" {
+        assertGeneratedCode(
+            NullableJavaFnType::class, setOf(
+                """
+    class NullableJavaFnType extends Object {
+        constructor(onCancellation: (() => void) | null)
+        readonly onCancellation: (() => void) | null;
+    }
+    """,
+                """
+    interface Runnable extends Object{
+        run(): void;
+    }
+    """,
             ),
             any = OBJECT,
         )
