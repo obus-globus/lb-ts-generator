@@ -281,6 +281,14 @@ These are documented in `liquidbounce-helper/docs/upstream-type-issues/`:
 
 ---
 
+## Resolved via post-patch — pending generator fold-in
+
+| ID | Description | Status |
+|----|-------------|--------|
+| F7 | **Field/method name collisions.** Java permits a field and a method to share a name (`onGround` + `onGround()`; records, JOML math, `Map.Entry`, enums); TS forbids it, so `propertiesOf(klass) + functionsOf(klass)` (TypeScriptGenerator.kt) emit both and the field silently shadows the method. | Fixed by post-patch `fix-member-collisions.py` (F7) in `lb-script-api-types` (v0.38.2 — 1,125 collisions / 687 files). **TODO:** fold the heuristic into `generateInterface` — *mutable field + pure zero-arg getter → drop method; else drop field* (parameterized overloads never dropped) — then demote the patch to a safety net. |
+
+---
+
 ## Script-author runtime compatibility under JDK 25
 
 The infrastructure changes (I-01, I-02) work around the same JDK 25
