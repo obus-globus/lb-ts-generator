@@ -1,9 +1,10 @@
 # Enhancements over the vanilla LiquidBounce script-api types
 
-This document inventories every change this repo (and its consumer,
-[`liquidbounce-helper`](https://github.com/clawdbot-silly-waddle/liquidbounce-helper))
-makes to the TypeScript declarations published by CCBlueX as
-`@ccbluex/liquidbounce-script-api`.
+This document inventories every change this repo (and its consumer pipeline,
+[`obus-globus/lb-script-api-types`](https://github.com/obus-globus/lb-script-api-types),
+which embeds this repo as its `generator/` submodule and publishes
+`@wunk/lb-script-api-types`) makes to the TypeScript declarations published by
+CCBlueX as `@ccbluex/liquidbounce-script-api`.
 
 > **"Vanilla"** in the comparison column means the output you'd get from
 > the original [`commandblock2/ts-generator`](https://github.com/commandblock2/ts-generator)
