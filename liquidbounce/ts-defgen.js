@@ -143,9 +143,19 @@ function generate(path, packageName) {
             .map((entry) => (entry[1] instanceof Class_1.Class ? entry[1] : entry[1].class))
             .filter((entry) => entry != undefined)
             .map((clazz) => [clazz.name, clazz])).values()]; // dedupe: a class bound under >1 alias must import once (F1)
+        // entry = [eventName, KClass, java.lang.Class]. Keep the Java Class: its
+        // .name is the JVM binary name (TitleEvent$Clear), which is what both the
+        // emitted .d.ts file name and its exported class name use. Kotlin
+        // qualifiedName turns nested classes into dotted paths (TitleEvent.Clear),
+        // which used to emit imports pointing at nonexistent TitleEvent/Clear.d.ts.
         const eventEntries = ReflectionUtil.getDeclaredField(EventKt_1.EventKt, "EVENT_NAME_TO_CLASS").entrySet().toArray()
-            .map(entry => [entry[0], j2kSafe(entry[1])])
+            .map(entry => [entry[0], j2kSafe(entry[1]), entry[1]])
             .filter(entry => entry[1]);
+        // The exported TS name for an event class: binary simple name ($-joined).
+        const eventTsName = (entry) => {
+            const binaryName = entry[2].name;
+            return binaryName.substring(binaryName.lastIndexOf(".") + 1);
+        };
         Client.displayChatMessage(`found ${eventEntries.length} events`);
         Client.displayChatMessage("looking for all jvm classes");
         const allClassInfos = findAllClassInfos();
@@ -258,13 +268,13 @@ ${globalEntries
 `;
         const importsForScriptEventPatch = `
 // imports for
-${eventEntries.map((entry) => entry[1]).map((kClassImpl) => `import type { ${kClassImpl.simpleName} } from '../types/${kClassImpl.qualifiedName.replaceAll(".", "/")}.d.ts'`).join("\n")}
+${eventEntries.map((entry) => `import type { ${eventTsName(entry)} } from '../types/${entry[2].name.replaceAll(".", "/")}.d.ts'`).join("\n")}
 
 
 `;
         const onEventsForScriptPatch = `
 // on events
-${eventEntries.map((entry) => `on(eventName: "${entry[0]}", handler: (${entry[0]}Event: ${entry[1].simpleName}) => void): void;`).join("\n")}
+${eventEntries.map((entry) => `on(eventName: "${entry[0]}", handler: (${entry[0]}Event: ${eventTsName(entry)}) => void): void;`).join("\n")}
 
 
 `;
