@@ -37,11 +37,14 @@ import java.lang.reflect.Method
 import java.lang.reflect.Modifier
 import java.lang.reflect.ParameterizedType
 import java.lang.reflect.Type
+import java.lang.reflect.TypeVariable
+import java.lang.reflect.WildcardType
 import kotlin.reflect.*
 import kotlin.reflect.full.createType
 import kotlin.reflect.full.declaredMemberFunctions
 import kotlin.reflect.full.memberFunctions
 import kotlin.reflect.full.declaredMemberProperties
+import kotlin.reflect.full.withNullability
 import kotlin.reflect.jvm.javaField
 import kotlin.reflect.jvm.javaGetter
 import kotlin.reflect.jvm.javaMethod
@@ -122,6 +125,14 @@ class TypeScriptGenerator(
         // type(s) to a disambiguated alias used at both the import and every
         // reference site (see tsNameFor / the two-pass in init).
         val typeAliases = mutableMapOf<KClass<*>, String>()
+
+        // Functional interfaces whose SAM is currently being rendered as an
+        // arrow. A SAM that references its own interface type (directly or
+        // through another functional interface) would otherwise recurse
+        // forever; on re-entry we emit the nominal name instead.
+        // NOTE: must be declared BEFORE the init block below — generateDefinition()
+        // runs from init, and Kotlin initializes properties in declaration order.
+        private val functionalInterfacesBeingRendered = mutableSetOf<Class<*>>()
 
         /** The TS name to reference [kClass] by in this module — its alias if
          * it collided with another import (or this class's own name), else its
@@ -363,8 +374,92 @@ class TypeScriptGenerator(
                 return null
             }
 
-            // Extract the type argument of `Iterable<T>`
-            return iterableSupertype.arguments.firstOrNull()?.type
+            // Extract the type argument of `Iterable<T>`. It is expressed in
+            // terms of the CLASSIFIER's own type parameters (`Collection<out E>
+            // : Iterable<E>` yields `E`), not the actual arguments of [kType] —
+            // substitute them, else `E` leaks into the emitted .d.ts as an
+            // undeclared identifier (e.g. `collection: E[]` for a
+            // `Collection<T>` parameter). Arguments that aren't resolvable
+            // (star projections, raw types) fall back to the variable's bound.
+            val element = iterableSupertype.arguments.firstOrNull()?.type ?: return null
+            val substitution = classifier.typeParameters.mapIndexedNotNull { index, parameter ->
+                kType.arguments.getOrNull(index)?.type?.let { parameter.name to it }
+            }.toMap()
+            return substituteTypeParameters(element, substitution, fallbackToBound = true)
+        }
+
+        /**
+         * Replaces [KTypeParameter] references in [kType] (recursively, through
+         * generic arguments) with the actual types given in [substitution]
+         * (keyed by parameter name).
+         *
+         * With [fallbackToBound], parameters missing from the map are replaced
+         * by their first upper bound (or `Any?`) instead of being kept — used
+         * where the surrounding declaration cannot legally reference them.
+         */
+        private fun substituteTypeParameters(
+            kType: KType,
+            substitution: Map<String, KType>,
+            fallbackToBound: Boolean = false,
+            seen: Set<String> = emptySet()
+        ): KType {
+            val classifier = kType.classifier
+            return when {
+                classifier is KTypeParameter -> {
+                    val replacement = when {
+                        classifier.name in substitution -> substitution.getValue(classifier.name)
+                        fallbackToBound && classifier.name !in seen ->
+                            classifier.upperBounds.firstOrNull()?.let {
+                                // `seen` guards recursive bounds (T : Comparable<T>)
+                                substituteTypeParameters(it, substitution, true, seen + classifier.name)
+                            } ?: KotlinAnyOrNull
+
+                        else -> return kType
+                    }
+                    if (kType.isMarkedNullable && !replacement.isMarkedNullable)
+                        replacement.withNullability(true)
+                    else
+                        replacement
+                }
+
+                classifier is KClass<*> && kType.arguments.isNotEmpty() -> {
+                    val newArguments = kType.arguments.map { projection ->
+                        val type = projection.type ?: return@map projection
+                        val substituted = substituteTypeParameters(type, substitution, fallbackToBound, seen)
+                        if (substituted == type) projection else KTypeProjection(projection.variance, substituted)
+                    }
+                    if (newArguments == kType.arguments) kType
+                    else try {
+                        classifier.createType(newArguments, kType.isMarkedNullable)
+                    } catch (_: Throwable) {
+                        // arity mismatch on specialized types — keep the original
+                        kType
+                    }
+                }
+
+                else -> kType
+            }
+        }
+
+        /** Recursively collects every [KTypeParameter] referenced by [kType]
+         * (including ones nested in generic arguments) that is not declared by
+         * the class ([declared]) and not collected yet. These must be declared
+         * on the member, or the emitted identifier is undefined. */
+        private fun collectFreeTypeParameters(
+            kType: KType,
+            declared: List<KTypeParameter>,
+            into: MutableList<KTypeParameter>
+        ) {
+            val classifier = kType.classifier
+            if (classifier is KTypeParameter
+                && declared.none { it.name == classifier.name }
+                && into.none { it.name == classifier.name }
+            ) {
+                into.add(classifier)
+            }
+            kType.arguments.forEach { argument ->
+                argument.type?.let { collectFreeTypeParameters(it, declared, into) }
+            }
         }
 
         private fun arrayFromKType(kType: KType): String {
@@ -589,22 +684,50 @@ class TypeScriptGenerator(
             ""
         }
 
-        private fun javaTypeToKotlinType(type: Type): KType {
+        /**
+         * Converts a java.lang.reflect.Type to a KType so that it can be
+         * rendered through [formatKType] (primitive mappings, dependentTypes
+         * registration, aliasing) instead of leaking raw qualified names.
+         *
+         * [substitution] maps type-variable names to actual KTypes resolved at
+         * the use site (e.g. `Predicate<String>` resolves Predicate's `T` to
+         * String). Type variables that are NOT resolvable (true erasure) fall
+         * back to their first bound's raw class, or Object — they must never
+         * surface as undeclared identifiers in the emitted TypeScript.
+         */
+        private fun javaTypeToKotlinType(
+            type: Type,
+            substitution: Map<String, KType> = emptyMap()
+        ): KType {
             return when (type) {
                 is Class<*> -> createKotlinType(type)
                 is ParameterizedType -> {
                     val rawType = (type.rawType as Class<*>).kotlin
                     val typeArgs = type.actualTypeArguments.map { arg ->
-                        when (arg) {
-                            is Class<*> -> createKotlinType(arg)
-                            else -> Any::class.createType(nullable = true)
-                        }
+                        javaTypeToKotlinType(arg, substitution)
                     }
                     rawType.createType(typeArgs.map { KTypeProjection.invariant(it) })
                 }
 
+                is TypeVariable<*> -> substitution[type.name] ?: eraseToBound(type)
+                is WildcardType ->
+                    type.upperBounds.firstOrNull()?.let { javaTypeToKotlinType(it, substitution) }
+                        ?: KotlinAnyOrNull
+
                 else -> Any::class.createType(nullable = true)
             }
+        }
+
+        /** Fallback for a type variable we cannot resolve at the use site:
+         * its first bound's raw class (nullable, like the old `Any?` fallback),
+         * or `Any?` when there is no usable bound. Never the bare variable name. */
+        private fun eraseToBound(typeVariable: TypeVariable<*>): KType {
+            val rawBound = when (val bound = typeVariable.bounds.firstOrNull()) {
+                is Class<*> -> bound
+                is ParameterizedType -> bound.rawType as? Class<*>
+                else -> null
+            } ?: return KotlinAnyOrNull
+            return createKotlinType(rawBound).withNullability(true)
         }
 
 
@@ -769,6 +892,20 @@ class TypeScriptGenerator(
                 emptyList<KFunction<*>>()
             }
 
+            // Default methods reflected off a generic interface's own KClass
+            // (the interfaceSupertypes branch below) carry the INTERFACE's type
+            // parameters (`Predicate<T>.and` references `T`), which a
+            // non-generic implementor never declares. Map each interface
+            // supertype's parameters to the actual type arguments of the
+            // implements clause, so they can be substituted at emission.
+            val supertypeSubstitutions: Map<KClass<*>, Map<String, KType>> =
+                interfaceSupertypes.mapNotNull { supertype ->
+                    val classifier = supertype.classifier as? KClass<*> ?: return@mapNotNull null
+                    classifier to classifier.typeParameters.mapIndexedNotNull { index, parameter ->
+                        supertype.arguments.getOrNull(index)?.type?.let { parameter.name to it }
+                    }.toMap()
+                }.toMap()
+
             (declaredFns.asSequence()
                     + inheritedOverloads.asSequence()
                     + interfaceSupertypes.flatMap {
@@ -790,23 +927,39 @@ class TypeScriptGenerator(
                 .sortedWith(compareBy({ it.name }, { it.toString() }))
                 .joinToString("") { function ->
                     val functionName = pipeline.transformFunctionName(function.name, function, klass)
-                    val returnType = pipeline.transformFunctionReturnType(function.returnType, function, klass)
-                    val parameters = function.parameters
-                        .drop(1)
-                        .joinToString(", ") { param ->
-                            val paramType = pipeline.transformFunctionParameterType(param.type, param, function, klass)
-                            "${param.name}: ${formatKType(paramType).formatWithoutParenthesis()}"
 
-                        }
+                    // A function reflected off an interface supertype keeps that
+                    // interface as its instance-parameter classifier — look up
+                    // the supertype's type-argument substitution for it.
+                    val substitution = (function.parameters.firstOrNull()?.type?.classifier as? KClass<*>)
+                        ?.let { owner -> supertypeSubstitutions[owner] }
+                        ?: emptyMap()
 
-                    val typeParamsNotOfClass = mutableListOf<KTypeParameter>()
-                    if (returnType.classifier is KTypeParameter && !typeParameters.any { it.name == (returnType.classifier as KTypeParameter).name })
-                        typeParamsNotOfClass.add(returnType.classifier as KTypeParameter)
-
-                    typeParamsNotOfClass.addAll(function.parameters.map { it.type.classifier }
-                        .filterIsInstance<KTypeParameter>()
-                        .filter { !typeParameters.any { parameter -> parameter.name == it.name } }
+                    val returnType = substituteTypeParameters(
+                        pipeline.transformFunctionReturnType(function.returnType, function, klass),
+                        substitution
                     )
+                    val parameterTypes = function.parameters
+                        .drop(1)
+                        .map { param ->
+                            param to substituteTypeParameters(
+                                pipeline.transformFunctionParameterType(param.type, param, function, klass),
+                                substitution
+                            )
+                        }
+                    val parameters = parameterTypes.joinToString(", ") { (param, paramType) ->
+                        "${param.name}: ${formatKType(paramType).formatWithoutParenthesis()}"
+                    }
+
+                    // Declare every method-level type variable the signature
+                    // references — including ones nested inside generic
+                    // arguments (`collection: Collection<T>`), which a
+                    // top-level-only scan missed, leaving them undeclared.
+                    val typeParamsNotOfClass = mutableListOf<KTypeParameter>()
+                    collectFreeTypeParameters(returnType, typeParameters, typeParamsNotOfClass)
+                    parameterTypes.forEach { (_, paramType) ->
+                        collectFreeTypeParameters(paramType, typeParameters, typeParamsNotOfClass)
+                    }
 
                     val visibility = when (function.visibility) {
                         KVisibility.PRIVATE -> "// private "
@@ -1018,57 +1171,66 @@ class TypeScriptGenerator(
         }
 
         /**
-         * Maps functional interface type to TypeScript lambda type
+         * Maps a functional interface type to a TypeScript arrow type.
+         *
+         * The SAM signature comes from Java reflection, but every type in it is
+         * converted to a KType ([javaTypeToKotlinType]) and rendered through
+         * [formatKType]. The previous implementation string-interpolated the
+         * fallback return type as a raw KType (its `toString()` — e.g.
+         * `kotlin.Boolean`, `java.util.Optional<...Resource>`), bypassing both
+         * the primitive mappings and the dependentTypes/tsNameFor import
+         * machinery.
+         *
+         * The interface's declared type variables are substituted with the
+         * actual type arguments at this use site (`Predicate<String>` renders
+         * its SAM `test(T)` as `(param0: string) => boolean`); unresolvable
+         * variables fall back to their bound via [javaTypeToKotlinType].
          */
         fun formatFunctionalInterfaceType(type: Type, kType: KType?): String {
             val sam = findSingleAbstractMethod(type) ?: return "Function"
 
-            // Get parameter types
-            val parameterTypes = mutableListOf<KType>()
+            val rawClass = when (type) {
+                is Class<*> -> type
+                is ParameterizedType -> type.rawType as? Class<*>
+                else -> null
+            }
 
-            // Try to use KType generic arguments if available
-            if (kType != null && kType.arguments.isNotEmpty()) {
-                // For functional interfaces, generic parameters can represent the parameter types
-                // and possibly the return type
-                kType.arguments.forEach {
-                    val argType = it.type
-                    if (argType != null) {
-                        parameterTypes.add(argType)
-                    }
+            // Break SAM self-reference cycles with the nominal type name
+            // (formatKType with transformFunctionalInterface=false). Strip the
+            // nullable marker — the caller appends `| null` itself.
+            if (rawClass != null && rawClass in functionalInterfacesBeingRendered) {
+                return kType
+                    ?.let { formatKType(it.withNullability(false), false, false).formatWithoutParenthesis() }
+                    ?: "Function"
+            }
+
+            rawClass?.let { functionalInterfacesBeingRendered.add(it) }
+            try {
+                // Resolve the interface's type variables from the actual type
+                // arguments at this use site (positional, by declaration order).
+                val substitution: Map<String, KType> =
+                    if (kType != null && rawClass != null) {
+                        rawClass.typeParameters.mapIndexedNotNull { index, typeVariable ->
+                            kType.arguments.getOrNull(index)?.type?.let { typeVariable.name to it }
+                        }.toMap()
+                    } else emptyMap()
+
+                val parameters = sam.parameters.mapIndexed { index, param ->
+                    val paramType = javaTypeToKotlinType(param.parameterizedType, substitution)
+                    "param$index: ${formatKType(paramType).formatWithoutParenthesis()}"
+                }.joinToString(", ")
+
+                val returnType = if (sam.returnType == Void.TYPE) {
+                    "void"
+                } else {
+                    formatKType(javaTypeToKotlinType(sam.genericReturnType, substitution))
+                        .formatWithoutParenthesis()
                 }
+
+                return "($parameters) => $returnType"
+            } finally {
+                rawClass?.let { functionalInterfacesBeingRendered.remove(it) }
             }
-
-            // If we couldn't get all parameters from KType, fall back to Java reflection
-            if (parameterTypes.isEmpty() || parameterTypes.size < sam.parameterCount) {
-                sam.parameters.forEach { param ->
-                    val paramType = param.parameterizedType
-                    val kotlinType = javaTypeToKotlinType(paramType)
-                    parameterTypes.add(kotlinType)
-                }
-            }
-
-            // Format parameters for TypeScript
-            val parameters = parameterTypes.take(sam.parameterCount).mapIndexed { index, paramType ->
-                // Use formatKType function from your existing code
-                // Assuming we can call this function from where this function is used
-                "param$index: ${formatKType(paramType).formatWithoutParenthesis()}"
-            }.joinToString(", ")
-
-            // Determine return type
-            val returnType = if (sam.returnType == Void.TYPE) {
-                "void"
-            } else if (kType != null && kType.arguments.size > sam.parameterCount) {
-                // Last generic argument might be the return type
-                formatKType(
-                    kType.arguments.last().type ?: Any::class.createType(nullable = true)
-                ).formatWithoutParenthesis()
-            } else {
-                // Fall back to Java reflection for return type
-                javaTypeToKotlinType(sam.genericReturnType)
-            }
-
-            // Return TypeScript function type
-            return "($parameters) => $returnType"
         }
 
     }
