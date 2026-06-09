@@ -1,6 +1,8 @@
 package me.ntrrgc.tsGenerator.tests
 
 import io.kotest.core.spec.style.StringSpec
+import io.kotest.matchers.string.shouldContain
+import io.kotest.matchers.string.shouldNotContain
 
 @Suppress("unused")
 class StringCheckerImpl : JavaGenericChecker<String> {
@@ -64,5 +66,26 @@ class TypeVariableTests : StringSpec({
             ),
             any = OBJECT,
         )
+    }
+})
+
+@Suppress("unused")
+enum class FBoundedEnum { ALPHA, BETA }
+
+// An F-bounded variable (`T extends Enum<T>`, from java.lang.Enum.valueOf
+// reflected onto every enum) must erase to Object, NOT to its raw bound:
+// the raw bound gets its missing type arguments padded with Object downstream
+// (`Enum<Object>`), which violates the bound's own constraint and emits
+// TS2344 at every use site.
+class FBoundedErasureTests : StringSpec({
+    "F-bounded type variables erase to Object, not a constraint-violating raw bound" {
+        val text = me.ntrrgc.tsGenerator.TypeScriptGenerator(
+            listOf(FBoundedEnum::class), intTypeName = "int",
+        ).definitionsText
+        // Commented-out private members are invisible to TS — only live
+        // declarations must be free of the constraint-violating instantiation.
+        val live = text.lines().filterNot { it.trimStart().startsWith("//") }.joinToString("\n")
+        live shouldNotContain "Enum<Object>"
+        live shouldContain "Class<Object>"
     }
 })

@@ -720,13 +720,21 @@ class TypeScriptGenerator(
 
         /** Fallback for a type variable we cannot resolve at the use site:
          * its first bound's raw class (nullable, like the old `Any?` fallback),
-         * or `Any?` when there is no usable bound. Never the bare variable name. */
+         * or `Any?` when there is no usable bound. Never the bare variable name.
+         *
+         * Only NON-GENERIC bounds are used: a generic bound is typically
+         * F-bounded (`T extends Enum<T>`, `T extends Comparable<T>`), and
+         * erasing it to the raw class gets its missing type arguments padded
+         * with `Object` downstream — `Enum<Object>` — which violates the
+         * bound's own constraint and emits TS2344 at every use site. Those
+         * erase to `Any?` as before. */
         private fun eraseToBound(typeVariable: TypeVariable<*>): KType {
             val rawBound = when (val bound = typeVariable.bounds.firstOrNull()) {
                 is Class<*> -> bound
                 is ParameterizedType -> bound.rawType as? Class<*>
                 else -> null
             } ?: return KotlinAnyOrNull
+            if (rawBound.typeParameters.isNotEmpty()) return KotlinAnyOrNull
             return createKotlinType(rawBound).withNullability(true)
         }
 
