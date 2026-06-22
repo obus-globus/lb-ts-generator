@@ -900,33 +900,144 @@ class TypeScriptGenerator(
                 emptyList<KFunction<*>>()
             }
 
-            // Default methods reflected off a generic interface's own KClass
-            // (the interfaceSupertypes branch below) carry the INTERFACE's type
-            // parameters (`Predicate<T>.and` references `T`), which a
-            // non-generic implementor never declares. Map each interface
-            // supertype's parameters to the actual type arguments of the
-            // implements clause, so they can be substituted at emission.
-            val supertypeSubstitutions: Map<KClass<*>, Map<String, KType>> =
-                interfaceSupertypes.mapNotNull { supertype ->
-                    val classifier = supertype.classifier as? KClass<*> ?: return@mapNotNull null
-                    classifier to classifier.typeParameters.mapIndexedNotNull { index, parameter ->
+            // B-fix: a class must structurally satisfy EVERY interface it
+            // implements, transitively. Ordinary classes redeclare the abstract
+            // interface methods in their own `declaredMemberFunctions`, so the
+            // old code re-emitted only the NON-abstract (default) methods of the
+            // DIRECT interfaces and relied on that. But Java enums (whose
+            // overrides kotlin-reflect does not surface as `declared`) and
+            // abstract classes that leave an interface method abstract were left
+            // missing those members, so the emitted type was not assignable to
+            // the interface (e.g. an enum packet type missing
+            // PacketType.direction()/state(); AbstractFloatIterator missing
+            // nextFloat). Walk the TRANSITIVE interface closure, compose each
+            // interface's type-argument substitution along the chain, and
+            // consider ALL of its members (abstract + default).
+            val interfaceClosure: List<Pair<KClass<*>, Map<String, KType>>> = run {
+                val out = mutableListOf<Pair<KClass<*>, Map<String, KType>>>()
+                val seen = mutableSetOf<KClass<*>>()
+                fun visit(iface: KClass<*>, subst: Map<String, KType>) {
+                    if (!seen.add(iface)) return
+                    out.add(iface to subst)
+                    val supers = try { iface.supertypes } catch (_: Throwable) { emptyList<KType>() }
+                    supers.forEach { st ->
+                        val sc = st.classifier as? KClass<*> ?: return@forEach
+                        if (!sc.java.isInterface) return@forEach
+                        // Resolve this supertype's type args through the current
+                        // substitution, then bind the supertype's own params to them.
+                        val childSubst = sc.typeParameters.mapIndexedNotNull { index, parameter ->
+                            st.arguments.getOrNull(index)?.type?.let { arg ->
+                                parameter.name to substituteTypeParameters(arg, subst, fallbackToBound = true)
+                            }
+                        }.toMap()
+                        visit(sc, childSubst)
+                    }
+                    // Robust fallback: kotlin-reflect's `supertypes` can throw on
+                    // (or under-report) some Java interfaces — swallowed above — which
+                    // would stop the transitive walk and silently drop a grandparent
+                    // interface's members (the real symptom: PacketType.state() two
+                    // hops above an enum). Java's interface list is reliable; walk it
+                    // too. These carry no substitution, which is fine: only the
+                    // non-generic abstract injection consumes the closure, and that
+                    // path needs none.
+                    val jIfaces = try { iface.java.interfaces } catch (_: Throwable) { emptyArray<Class<*>>() }
+                    jIfaces.forEach { ji ->
+                        val jk = try { ji.kotlin } catch (_: Throwable) { null } ?: return@forEach
+                        visit(jk, emptyMap())
+                    }
+                }
+                interfaceSupertypes.forEach { supertype ->
+                    val classifier = supertype.classifier as? KClass<*> ?: return@forEach
+                    val subst = classifier.typeParameters.mapIndexedNotNull { index, parameter ->
                         supertype.arguments.getOrNull(index)?.type?.let { parameter.name to it }
                     }.toMap()
-                }.toMap()
+                    visit(classifier, subst)
+                }
+                out
+            }
+
+            // Map every interface in the closure to its composed substitution so
+            // the emit loop can resolve interface-declared type params (`T`) to
+            // the concrete arguments at the implements site. First binding wins
+            // on the rare diamond-with-different-args case.
+            val supertypeSubstitutions: Map<KClass<*>, Map<String, KType>> = run {
+                val m = mutableMapOf<KClass<*>, Map<String, KType>>()
+                interfaceClosure.forEach { (iface, subst) -> m.putIfAbsent(iface, subst) }
+                m
+            }
+
+            // Keep the prior behaviour: emit the DIRECT interfaces' non-abstract
+            // (default) methods, substituting the interface's type arguments (W21).
+            val directDefaults = interfaceSupertypes.asSequence().flatMap { st ->
+                val sc = st.classifier as? KClass<*> ?: return@flatMap emptySequence<KFunction<*>>()
+                try { sc.declaredMemberFunctions.asSequence().filter { !it.isAbstract } }
+                catch (_: Throwable) { emptySequence() }
+            }
+
+            // ADD any interface method the class is missing — abstract OR default —
+            // but ONLY from NON-GENERIC interfaces with NON-GENERIC methods.
+            // `directDefaults` above only covers DIRECT interfaces, so a DEFAULT
+            // method on a TRANSITIVE interface (e.g. PacketType.state() two hops up)
+            // would otherwise be dropped; abstract-only filtering misses it too.
+            // Restricting to the generic-free subset fixes the common real gap (Java
+            // enums / abstract classes missing simple interface methods — PacketType
+            // direction()/state(), FloatIterator nextFloat()) WITHOUT re-introducing
+            // the generic erasure/variance debt (Comparable<Object> constraint breaks,
+            // Function/Predicate covariance) that full transitive emission caused; a
+            // non-generic method needs no substitution, so nothing erases to a
+            // constraint-violating Object. "Already provided" is matched by name +
+            // arity (the interface signature is still unsubstituted here, so a
+            // type-aware match would miss a concrete override and emit it twice).
+            val declaredNameArity = (declaredFns.asSequence() + inheritedOverloads.asSequence())
+                .mapTo(mutableSetOf<Pair<String, Int>>()) { it.name to (it.parameters.size - 1) }
+            // Methods the class already provides CONCRETELY through inheritance (a
+            // base class), so injecting an interface method of the same name+arity
+            // would collide (TS2416/TS2430). Skip them for non-enums. Enums are the
+            // exception the whole fix targets: kotlin-reflect does not surface a
+            // Java enum's concrete interface impls as members at all, so an empty
+            // set here keeps direction()/state() injectable.
+            val concreteInherited: Set<Pair<String, Int>> = if (klass.java.isEnum) emptySet() else try {
+                klass.memberFunctions.asSequence().filter { !it.isAbstract }
+                    .mapTo(mutableSetOf()) { it.name to (it.parameters.size - 1) }
+            } catch (_: Throwable) { emptySet() }
+            val transitiveNonGeneric = interfaceClosure.asSequence()
+                .filter { (iface, _) -> iface.typeParameters.isEmpty() }
+                .flatMap { (iface, _) ->
+                    try { iface.declaredMemberFunctions.asSequence() }
+                    catch (_: Throwable) { emptySequence<KFunction<*>>() }
+                }
+                .filter { fn ->
+                    // SIMPLE signature only: return + every param a concrete,
+                    // non-parameterised type. This keeps the real gap (direction():
+                    // Direction, nextFloat(): number, getBackend(): X) and excludes
+                    // generic-typed members (Optional<...>, Comparable<Object>,
+                    // fastutil maps) whose Object-erasure breaks constraints or whose
+                    // type arguments don't import.
+                    // Also exclude Iterable/Map/array-backed types: the generator
+                    // renders them structurally (e.g. `Foo[]`) and does NOT add an
+                    // import, so injecting a member that names one yields TS2304
+                    // ("cannot find name"). Concrete non-collection types import
+                    // normally via dependentTypes.
+                    fun simple(t: KType): Boolean {
+                        val c = t.classifier
+                        return c is KClass<*> && t.arguments.isEmpty() && !shouldIgnoreSuperclass(c)
+                    }
+                    // PUBLIC only: a protected interface method (clone()/finalize()
+                    // off Object, rare protected SAMs) is illegal on a TS interface
+                    // (TS1070) and clashes in visibility with an existing overload
+                    // (TS2385); consumers can only call the public surface anyway.
+                    fn.visibility == KVisibility.PUBLIC
+                        && fn.typeParameters.isEmpty()
+                        && simple(fn.returnType)
+                        && fn.parameters.drop(1).all { simple(it.type) }
+                        && (fn.name to (fn.parameters.size - 1)) !in declaredNameArity
+                        && (fn.name to (fn.parameters.size - 1)) !in concreteInherited
+                }
 
             (declaredFns.asSequence()
                     + inheritedOverloads.asSequence()
-                    + interfaceSupertypes.flatMap {
-                if (it.classifier is KClass<*>)
-                    (it.classifier as KClass<*>)
-                        .declaredMemberFunctions
-                        .filter { interfaceFunction ->
-                            !interfaceFunction.isAbstract
-                        }
-                else
-                    emptyList<KFunction<*>>()
-
-            }.asSequence()
+                    + directDefaults
+                    + transitiveNonGeneric
                     )
                 .let { functionsList ->
                     pipeline.transformFunctionList(functionsList.toList(), klass)
