@@ -344,22 +344,38 @@ class TypeScriptGenerator(
             // but you can see there is definitely no way of acquiring the actual type with proper API
             // would you rather rely on .toString() and parse it and rely on the alternative shitty hack?
             // place the breakpoint and see for yourself
+            // A type parameter constrained to something other than Object/Any. Both
+            // padding a missing argument AND erasing a method type-variable to Object
+            // against such a parameter violate its bound (TS2344, the dominant bucket:
+            // `EnumCodec<Object>` where E : Enum<E> & StringRepresentable, `<T : Entity>`,
+            // ...). `any` satisfies any constraint; `Object` is kept for unconstrained
+            // parameters (so `Class<Object>` stays precise).
+            fun constrained(tp: KTypeParameter): Boolean = try {
+                tp.upperBounds.any { b ->
+                    val c = b.classifier
+                    !(c is KClass<*> && (isSameClass(c, Any::class) || c.qualifiedName == "java.lang.Object"))
+                }
+            } catch (_: Throwable) { false }
+            fun isErasedObject(t: KType?): Boolean {
+                val c = (t?.classifier as? KClass<*>) ?: return t == null
+                return isSameClass(c, Any::class) || c.qualifiedName == "java.lang.Object"
+            }
+
             if (kType.arguments.size != kClass.typeParameters.size) {
                 return binaryName + if (kClass.typeParameters.isNotEmpty()) "<${
-                    (1..kClass.typeParameters.size).joinToString(
-                        ", "
-                    ) { "Object" }
+                    kClass.typeParameters.joinToString(", ") { if (constrained(it)) "any" else "Object" }
                 }>" else ""
             }
 
-            // Only add generic parameters if counts match
+            // Counts match: emit the arguments, but an Object that erased against a
+            // constrained parameter is an artifact (Object can't legally hold there) —
+            // emit `any` rather than a bound-violating `Object`.
             return binaryName + if (kType.arguments.isNotEmpty()) {
-                "<" + kType.arguments.joinToString(", ") { arg ->
-                    formatKType(
-                        arg.type ?: KotlinNotNull,
-                        true
-                    ).formatWithoutParenthesis()
-                } + ">"
+                "<" + kType.arguments.mapIndexed { i, arg ->
+                    val tp = kClass.typeParameters.getOrNull(i)
+                    if (tp != null && constrained(tp) && isErasedObject(arg.type)) "any"
+                    else formatKType(arg.type ?: KotlinNotNull, true).formatWithoutParenthesis()
+                }.joinToString(", ") + ">"
             } else ""
         }
 
