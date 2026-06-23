@@ -493,6 +493,14 @@ class TypeScriptGenerator(
         // GPLv3 does not apply for this function
         private fun mapFromKType(kType: KType): String {
 
+            // Maps whose reflected type-argument count isn't 2 (fastutil primitive
+            // maps like Int2ObjectMap<V> carry one type param because the key is a
+            // primitive) would index past `arguments` and throw, dropping the call to
+            // the nominal fallback -> an undefined `Int2ObjectMap` name (TS2304).
+            // Render a permissive index signature instead; the precise key/value is
+            // unrecoverable from the erased single arg anyway.
+            if (kType.arguments.size < 2) return "{ [key: string]: any }"
+
             val rawKeyType = kType.arguments[0].type ?: KotlinAnyOrNull
             val keyType = formatKType(rawKeyType)
             val valueType = formatKType(kType.arguments[1].type ?: KotlinAnyOrNull)
@@ -1399,6 +1407,18 @@ class TypeScriptGenerator(
             .mapNotNull { (k, v) -> k.qualifiedName?.let { it to v } }
             .toMap()
 
+    // A type that implements `Iterable<Self>` (e.g. java.nio.file.Path : Iterable<Path>)
+    // is a real class that merely happens to be iterable, NOT a collection. Treating it
+    // as one (no module, rendered as the nominal `Path[]`) leaves the name undefined
+    // (TS2304), because no `Path.d.ts` is emitted to import. Detect the self-iterating
+    // shape so such a type keeps a module and gets imported.
+    private fun isSelfIterable(klass: KClass<*>): Boolean = try {
+        klass.supertypes
+            .firstOrNull { it.classifier == Iterable::class }
+            ?.arguments?.firstOrNull()?.type?.classifier
+            ?.let { it is KClass<*> && isSameClass(it, klass) } == true
+    } catch (_: Throwable) { false }
+
     private val shouldIgnoreSuperclass: (KClass<*>) -> Boolean = { klass: KClass<*> ->
         try {
             if (klass.objectInstance != null) {
@@ -1406,7 +1426,7 @@ class TypeScriptGenerator(
                 false
             } else {
                 val array = klass.javaObjectType.isArray
-                val iterable = Iterable::class.java.isAssignableFrom(klass.java)
+                val iterable = Iterable::class.java.isAssignableFrom(klass.java) && !isSelfIterable(klass)
                 val map = Map::class.java.isAssignableFrom(klass.java)
                 iterable || array || map
             }
