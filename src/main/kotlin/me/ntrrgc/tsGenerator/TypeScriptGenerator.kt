@@ -648,7 +648,14 @@ class TypeScriptGenerator(
                             )
                         ) {
                             formatKType(bound) // unused result but needs to record dependencies
-                            "Object | number | string | boolean"
+                            // A Java `<T>` (upper bound Any/Object) accepts ANY value,
+                            // including arrays, void, maps and functions. The old
+                            // `Object | number | string | boolean` union excluded all of
+                            // those, so every instantiation with such an argument failed
+                            // the bound (TS2344). `unknown` is the top type and accepts
+                            // them all; applied uniformly it stays consistent across
+                            // extends/implements chains.
+                            "unknown"
                         } else
                             formatKType(bound, true, false).formatWithoutParenthesis()
                     }

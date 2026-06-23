@@ -32,7 +32,7 @@ class SamArrowTests : StringSpec({
     }
     """,
                 """
-    class JavaBox<T extends Object | number | string | boolean> extends Object {
+    class JavaBox<T extends unknown> extends Object {
         constructor()
         unwrap(): T;
     }

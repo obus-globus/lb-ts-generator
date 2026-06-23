@@ -43,7 +43,7 @@ class TypeVariableTests : StringSpec({
     }
     """,
                 """
-    interface JavaGenericChecker<T extends Object | number | string | boolean> extends Object{
+    interface JavaGenericChecker<T extends unknown> extends Object{
         and(arg0: (param0: T) => boolean): (param0: T) => boolean;
         test(arg0: T): boolean;
     }
@@ -59,7 +59,7 @@ class TypeVariableTests : StringSpec({
                 """
     class ErasedCollections extends Object {
         constructor()
-        containsItem<T extends Object | number | string | boolean>(item: T, collection: T[]): boolean;
+        containsItem<T extends unknown>(item: T, collection: T[]): boolean;
         countOf(items: (Object | null)[]): int;
     }
     """,

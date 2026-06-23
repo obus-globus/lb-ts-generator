@@ -61,7 +61,7 @@ class FunctionTypeTests : StringSpec({
         assertGeneratedCode(
             GenericFnTypes::class, setOf(
                 """
-    class GenericFnTypes<T extends Object | number | string | boolean> extends Object {
+    class GenericFnTypes<T extends unknown> extends Object {
         constructor(consume: (param0: T) => void)
         readonly consume: (param0: T) => void;
     }
