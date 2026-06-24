@@ -145,17 +145,21 @@ class TypeScriptGenerator(
         val moduleText: String by lazy {
             val depth = path.count { it == '/' }
 
-            dependentTypes.sortedBy { it.qualifiedName ?: it.simpleName ?: "" }.joinToString("\n", postfix = "\n") {
-                val importPath = modules[modules.keys.find { key -> isSameClass(key, it) }]!!.path
-
+            dependentTypes.sortedBy { it.qualifiedName ?: it.simpleName ?: "" }.mapNotNull {
+                // A dependent type may have no emitted module (it was skipped, e.g. a
+                // class whose reflection failed under Kotlin 2.4.0). Skip its import
+                // rather than asserting (`!!`) a module exists -- a dangling name is no
+                // worse than aborting. Computed lazily after every module is built, so
+                // the skip is order-independent.
+                val mod = modules[modules.keys.find { key -> isSameClass(key, it) }] ?: return@mapNotNull null
                 val upLevels = "../".repeat(depth)
-                val downPath = importPath.removePrefix("/")
+                val downPath = mod.path.removePrefix("/")
 
                 val name = it.binaryName()
                 val alias = typeAliases[it]
                 val imported = if (alias != null) "$name as $alias" else name
                 "import type { $imported } from '$upLevels$downPath'"
-            } + "export " + definition
+            }.joinToString("\n", postfix = "\n") { it } + "export " + definition
         }
 
 
@@ -1548,7 +1552,18 @@ class TypeScriptGenerator(
             } != null)
             return
 
-        val module = TypeScriptModule(klass)
+        // Per-class resilience: a single class whose reflection fails (e.g. Kotlin
+        // 2.4.0's reflect throws KotlinReflectionInternalError "could not compute
+        // caller" for some abstract operator funs) must NOT abort the whole run --
+        // skip just that class. Without this an uncaught error in generateInterface
+        // (e.g. at `klass.typeParameters`) on a single ROOT class produced an empty
+        // output ("Array is empty").
+        val module = try {
+            TypeScriptModule(klass)
+        } catch (t: Throwable) {
+            println("Skipping ${klass.qualifiedName ?: klass}: ${t.javaClass.simpleName}: ${t.message}")
+            return
+        }
         modules[klass] = module
         module.dependentTypes.forEach { visitClass(it) }
     }
