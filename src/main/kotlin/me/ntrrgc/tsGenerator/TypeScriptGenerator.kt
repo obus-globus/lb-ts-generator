@@ -109,13 +109,30 @@ class TypeScriptGenerator(
 ) {
 
 
+    // Either a freshly-reflected [TypeScriptModule] or a [CachedModule] reused
+    // verbatim from a prior run (see ModuleCache). The output writer and the
+    // cross-module import-path lookups only need path + moduleText.
+    interface GeneratedModule {
+        val path: String
+        val moduleText: String
+        val definition: String
+    }
+
+    /** A module reused verbatim from the on-disk cache -- no reflection. */
+    class CachedModule(
+        override val path: String,
+        override val moduleText: String,
+    ) : GeneratedModule {
+        override val definition: String get() = moduleText
+    }
+
     // We make an assumption of the Modules WILL contain only 1 class
     // because there is no reliable way of dumping information at runtime
     // source: claude-3-5-sonnet
     inner class TypeScriptModule(
         val klass: KClass<*>
-    ) {
-        val path: String
+    ) : GeneratedModule {
+        override val path: String
 
         val dependentTypes = mutableSetOf<KClass<*>>()
 
@@ -140,9 +157,9 @@ class TypeScriptGenerator(
         private fun tsNameFor(kClass: KClass<*>): String =
             typeAliases[kClass] ?: kClass.binaryName()
 
-        var definition: String
+        override var definition: String
 
-        val moduleText: String by lazy {
+        override val moduleText: String by lazy {
             val depth = path.count { it == '/' }
 
             dependentTypes.sortedBy { it.qualifiedName ?: it.simpleName ?: "" }.mapNotNull {
@@ -1389,7 +1406,20 @@ class TypeScriptGenerator(
 
     }
 
-    private val modules = mutableMapOf<KClass<*>, TypeScriptModule>()
+    private val modules = mutableMapOf<KClass<*>, GeneratedModule>()
+
+    // Optional persistent render cache (ModuleCache). Enabled only when the env
+    // var TSGEN_CACHE_DIR is set (the regen sets it); off for normal test/embed
+    // runs. Lets foundational-library classes from unchanged jars skip reflection
+    // by reusing the prior run's rendered .d.ts. See ModuleCache for soundness.
+    private val moduleCache: ModuleCache? = run {
+        val dir = System.getProperty("tsgen.cacheDir") ?: System.getenv("TSGEN_CACHE_DIR")
+        if (dir.isNullOrBlank()) null
+        else ModuleCache.open(
+            java.io.File(dir),
+            try { TypeScriptGenerator::class.java.protectionDomain?.codeSource?.location } catch (t: Throwable) { null }
+        )
+    }
 
     private val pipeline = ClassTransformerPipeline(classTransformers)
 
@@ -1483,6 +1513,24 @@ class TypeScriptGenerator(
                 print("Skipping all nested class for $it, exception occurred: ${throwable.message})")
             }
         }
+
+        // Persist the render cache for next time. Store every freshly-rendered
+        // module (reused ones were already carried forward inside
+        // ModuleCache.tryReuse). Runs after the whole walk so each moduleText
+        // resolves its imports against a fully-populated module set.
+        moduleCache?.let { mc ->
+            modules.forEach { (klass, mod) ->
+                if (mod is TypeScriptModule) {
+                    mc.recordFresh(
+                        klass,
+                        mod.path,
+                        mod.dependentTypes.mapNotNull { it.java.name },
+                        mod.moduleText
+                    )
+                }
+            }
+            mc.flush()
+        }
     }
 
     companion object {
@@ -1558,6 +1606,16 @@ class TypeScriptGenerator(
         // skip just that class. Without this an uncaught error in generateInterface
         // (e.g. at `klass.typeParameters`) on a single ROOT class produced an empty
         // output ("Array is empty").
+        // Cache short-circuit: reuse the prior run's rendered module for a
+        // foundational class whose source jar (and the generator) are unchanged.
+        // No reflection happens; we still re-enqueue the cached dependent types
+        // so any type reachable ONLY through this class is still emitted.
+        moduleCache?.tryReuse(klass)?.let { reused ->
+            modules[klass] = CachedModule(reused.path, reused.moduleText)
+            reused.deps.forEach { visitClass(it) }
+            return
+        }
+
         val module = try {
             TypeScriptModule(klass)
         } catch (t: Throwable) {
@@ -1577,6 +1635,11 @@ class TypeScriptGenerator(
 
 
     // Public API:
+
+    /** Number of modules served from the persistent cache (0 if cache off). */
+    @Suppress("unused")
+    val cacheReuseCount: Int
+        get() = moduleCache?.reused ?: 0
 
     @Suppress("unused")
     val definitionsAsModules: Map<String, String>
