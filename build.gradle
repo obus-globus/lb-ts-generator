@@ -94,4 +94,14 @@ shadowJar {
     mergeServiceFiles()
 }
 
+// Build byte-reproducible archives: drop per-entry timestamps and use a stable
+// entry order. Without this the shadow jar's content hash changes on every
+// rebuild (jars embed file mtimes), which would defeat the regen render cache —
+// ModuleCache keys the whole cache on the generator jar's own sha, so a
+// non-reproducible jar invalidates the persisted cache on every CI run.
+tasks.withType(AbstractArchiveTask).configureEach {
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
+}
+
 
