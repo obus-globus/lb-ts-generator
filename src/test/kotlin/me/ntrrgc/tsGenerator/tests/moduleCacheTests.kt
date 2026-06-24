@@ -3,11 +3,13 @@
  *
  * Proves the persistent render cache is sound: a "warm" run (cache populated by
  * a prior "cold" run) must produce byte-identical output AND actually reuse
- * foundational-library modules instead of re-reflecting them.
+ * modules instead of re-reflecting them.
  *
- * Foundational roots (java.*) are used because only those are eligible for the
- * cache (see ModuleCache.FOUNDATIONAL). The cache dir is passed via the
- * `tsgen.cacheDir` system property so it can be driven in-process.
+ * Eligibility is purely content-hash based (own jar + every direct-dep jar + the
+ * generator jar unchanged); there is no package allow-list. JDK roots (java.*)
+ * are used here only because they're stable and self-contained within the test
+ * classpath. The cache dir is passed via the `tsgen.cacheDir` system property so
+ * it can be driven in-process.
  */
 package me.ntrrgc.tsGenerator.tests
 
@@ -20,7 +22,7 @@ import java.nio.file.Files
 
 class ModuleCacheTests : StringSpec({
 
-    "warm cache reuses foundational modules and reproduces identical output" {
+    "warm cache reuses modules and reproduces identical output" {
         val cacheDir = Files.createTempDirectory("tsgen-cache-test").toFile()
         val prop = "tsgen.cacheDir"
         val roots = listOf(
@@ -39,7 +41,7 @@ class ModuleCacheTests : StringSpec({
             java.io.File(cacheDir, "manifest.tsv").exists() shouldBe true
             java.io.File(cacheDir, "raw").isDirectory shouldBe true
 
-            // Warm run: same roots, cache now populated -> foundational classes
+            // Warm run: same roots, cache now populated -> the classes
             // are reused (no reflection) and the output must be identical.
             val gen2 = TypeScriptGenerator(roots)
             val warm = gen2.definitionsAsModules

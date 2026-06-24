@@ -2,29 +2,39 @@
  * Persistent per-class render cache for the regen.
  *
  * The regen's cost is the transitive reflection walk over ~56k classes in
- * TypeScriptGenerator. Roughly half of those classes live in foundational
- * library jars (the JDK, kotlin-stdlib, fastutil, netty, guava, log4j, lwjgl,
- * icu4j, the GraalVM/Truffle runtime, ...) that do NOT change between regens of
- * the same dependency set -- only `net.minecraft.*` / `net.ccbluex.*` and the
- * MC-coupled jars (mojang, viaversion, fabric, sodium, iris) move on an LB/MC
- * bump. Re-reflecting the foundational half every run is pure waste.
+ * TypeScriptGenerator. Most of those classes live in library jars (the JDK,
+ * kotlin-stdlib, fastutil, netty, guava, log4j, lwjgl, icu4j, the GraalVM/Truffle
+ * runtime, ...) that do NOT change between regens of the same dependency set --
+ * typically only `net.ccbluex.*` (and, on an MC bump, `net.minecraft.*` + the
+ * MC-coupled jars: mojang, viaversion, fabric, sodium, iris) move. Re-reflecting
+ * the unchanged majority every run is pure waste.
  *
  * This cache lets a regen reuse the previous run's *rendered* `.d.ts` text for a
- * foundational class when both
- *   (a) the class's source jar is byte-for-byte unchanged (content sha), and
- *   (b) the generator jar itself is unchanged (its own sha),
- * are true. On a hit the class is not reflected at all: the prior rendered
- * module text is read back from `<cacheDir>/raw/<path>` and dropped straight
- * into the output.
+ * class when all of:
+ *   (a) the generator jar itself is unchanged (its own content sha), and
+ *   (b) the class's own source jar is byte-for-byte unchanged (content sha), and
+ *   (c) every jar the class DIRECTLY imports from is also unchanged (content sha),
+ * hold. On a hit the class is not reflected at all: the prior rendered module
+ * text is read back from `<cacheDir>/raw/<path>` and dropped straight into the
+ * output.
  *
  * Soundness. A rendered module bakes in `import` paths and collision aliases
- * resolved against the *names* of its dependent types. Reusing it is only sound
- * if that whole transitive dependent set is also unchanged. We guarantee this by
- * caching ONLY classes whose package is in [FOUNDATIONAL] -- libraries that, by
- * dependency direction, never reference the volatile minecraft/ccbluex/via jars,
- * so their transitive closure stays within foundational + JDK types whose names
- * don't move. The generator is deterministic (see determinismTests), so identical
+ * resolved against the *names* of its DIRECT dependent types (the import lines).
+ * Reusing the text is sound iff that direct dependent set, and each dependent's
+ * path/name, are unchanged. Rule (b) keeps the class's own bytecode -- hence its
+ * dependent set and collision aliases -- identical; rule (c) keeps every imported
+ * dependent present at the same path (an unchanged jar can't have renamed/removed
+ * the class). There is NO package allow-list: gating is purely by content hash,
+ * which is what makes it correct (any changed jar -> sha mismatch -> miss ->
+ * re-render). The generator is deterministic (see determinismTests), so identical
  * jar + identical generator => identical output.
+ *
+ * Known narrow gap: if a DIRECT dependent reflects fine on the run that wrote the
+ * cache but (non-deterministically) fails reflection on the reusing run with an
+ * unchanged jar, the reusing run would drop that dependent's module while the
+ * cached text still imports it -> a dangling import. This requires
+ * non-deterministic reflection failure on an unchanged jar; the typecheck gate's
+ * import-resolution check (Part C) catches it.
  *
  * The cache is OFF unless the env var `TSGEN_CACHE_DIR` points at a directory;
  * normal `gradlew test` and any non-regen embedding are completely unaffected.
