@@ -168,7 +168,7 @@ class TypeScriptGenerator(
                 // rather than asserting (`!!`) a module exists -- a dangling name is no
                 // worse than aborting. Computed lazily after every module is built, so
                 // the skip is order-independent.
-                val mod = modules[modules.keys.find { key -> isSameClass(key, it) }] ?: return@mapNotNull null
+                val mod = modulesByName[moduleKeyOf(it)] ?: return@mapNotNull null
                 val upLevels = "../".repeat(depth)
                 val downPath = mod.path.removePrefix("/")
 
@@ -1408,6 +1408,22 @@ class TypeScriptGenerator(
 
     private val modules = mutableMapOf<KClass<*>, GeneratedModule>()
 
+    // O(1) by-name index mirroring [modules], keyed exactly as isSameClass
+    // compares (qualifiedName; all null-qualifiedName classes share one bucket,
+    // matching the old `null == null` behavior of the linear scans this replaces).
+    // The previous code located a class's module with `modules.keys.find { isSameClass }`
+    // -- an O(n) scan per call, run once per class on the visited-check AND per
+    // dependent during import resolution, i.e. O(n^2) over ~57k classes (and it
+    // recomputed qualifiedName on every comparison). This index makes both O(1).
+    private val modulesByName = HashMap<String, GeneratedModule>()
+
+    private fun moduleKeyOf(klass: KClass<*>): String = klass.qualifiedName ?: NULL_QUALIFIED_NAME
+
+    private fun putModule(klass: KClass<*>, module: GeneratedModule) {
+        modules[klass] = module
+        modulesByName.putIfAbsent(moduleKeyOf(klass), module)
+    }
+
     // Optional persistent render cache (ModuleCache). Enabled only when the env
     // var TSGEN_CACHE_DIR is set (the regen sets it); off for normal test/embed
     // runs. Lets foundational-library classes from unchanged jars skip reflection
@@ -1534,6 +1550,11 @@ class TypeScriptGenerator(
     }
 
     companion object {
+        // Shared key for classes with no qualifiedName (local/anonymous). The old
+        // linear scans treated all such classes as "the same" (null == null); this
+        // preserves that. No real class is named "\u0000NULL".
+        private const val NULL_QUALIFIED_NAME = "\u0000NULL"
+
         private val KotlinAnyOrNull = Any::class.createType(nullable = true)
         private val KotlinNotNull = Any::class.createType(nullable = false)
 
@@ -1592,12 +1613,7 @@ class TypeScriptGenerator(
                     klass,
                     it
                 )
-            } > 0 || shouldIgnoreSuperclass(klass) || modules.keys.find { module ->
-                isSameClass(
-                    module,
-                    klass
-                )
-            } != null)
+            } > 0 || shouldIgnoreSuperclass(klass) || modulesByName.containsKey(moduleKeyOf(klass)))
             return
 
         // Per-class resilience: a single class whose reflection fails (e.g. Kotlin
@@ -1611,7 +1627,7 @@ class TypeScriptGenerator(
         // No reflection happens; we still re-enqueue the cached dependent types
         // so any type reachable ONLY through this class is still emitted.
         moduleCache?.tryReuse(klass)?.let { reused ->
-            modules[klass] = CachedModule(reused.path, reused.moduleText)
+            putModule(klass, CachedModule(reused.path, reused.moduleText))
             reused.deps.forEach { visitClass(it) }
             return
         }
@@ -1622,7 +1638,7 @@ class TypeScriptGenerator(
             println("Skipping ${klass.qualifiedName ?: klass}: ${t.javaClass.simpleName}: ${t.message}")
             return
         }
-        modules[klass] = module
+        putModule(klass, module)
         module.dependentTypes.forEach { visitClass(it) }
     }
 
