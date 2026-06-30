@@ -872,29 +872,42 @@ class TypeScriptGenerator(
                 // Force early class loading to trigger any NoClassDefFoundError
                 klass.java.declaredConstructors
 
-                klass.constructors.sortedBy { it.toString() }.joinToString("") { constructor ->
+                val allCtors = klass.constructors.sortedBy { it.toString() }
+                // TypeScript forbids mixed visibility across overloads of the same
+                // member (TS2385), but a Java class routinely has e.g. a public AND
+                // a private constructor. Normalize:
+                //   - if the class is publicly constructible, emit ONLY its public
+                //     constructors (private/protected overloads aren't public API,
+                //     and a consumer couldn't call them anyway);
+                //   - otherwise emit ALL of them under ONE uniform modifier so a
+                //     non-constructible class still can't be `new`-ed (W-#14).
+                // Only PRIVATE/PROTECTED are "non-public". Everything else —
+                // PUBLIC, INTERNAL, and crucially the NULL/unknown visibility that
+                // kotlin-reflect reports for many *Java* constructors — is treated
+                // as public (constructible), matching the prior `else -> ""`. Doing
+                // otherwise marks those classes' ctors private and breaks every
+                // subclass with TS2675 ("cannot extend; constructor is private").
+                val isNonPublicCtor = { c: KFunction<*> ->
+                    c.visibility == KVisibility.PRIVATE || c.visibility == KVisibility.PROTECTED
+                }
+                val hasPublic = allCtors.any { !isNonPublicCtor(it) }
+                val emitCtors = if (hasPublic) allCtors.filterNot(isNonPublicCtor) else allCtors
+                val uniformVisibility = when {
+                    hasPublic -> ""
+                    allCtors.any { it.visibility == KVisibility.PROTECTED } -> "protected "
+                    else -> "private "
+                }
+                emitCtors.joinToString("") { constructor ->
                     val parameters = constructor.parameters
                         .joinToString(", ") { param ->
                             val paramType =
                                 pipeline.transformFunctionParameterType(param.type, param, constructor, klass)
                             "${param.name}: ${formatKType(paramType).formatWithoutParenthesis()}"
                         }
-                    val visibility = when (constructor.visibility) {
-                        // W-#14: emit real TS `private constructor(...)` instead of
-                        // a `// private constructor(...)` comment. The comment form
-                        // is invisible to tsc — emitting the real modifier prevents
-                        // `new Foo()` at the call site for private-constructor types
-                        // (e.g. utility classes, sealed-class instances).
-                        KVisibility.PRIVATE -> "private "
-                        KVisibility.PROTECTED -> "protected "
-                        KVisibility.PUBLIC -> ""
-                        KVisibility.INTERNAL -> ""
-                        else -> ""
-                    }
                     val ctorDoc = try {
                         kdocSource?.tsdocForFqn("${klass.qualifiedName}.<init>", "    ")
                     } catch (_: Throwable) { null } ?: ""
-                    (ctorDoc + "    ${visibility}constructor($parameters)\n")
+                    (ctorDoc + "    ${uniformVisibility}constructor($parameters)\n")
                         .commentIfInvalid()
                 }
             } catch (e: Throwable) {
