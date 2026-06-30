@@ -1108,6 +1108,22 @@ class TypeScriptGenerator(
                     pipeline.transformFunctionList(functionsList.toList(), klass)
                 }.filter { !MIXIN_COUNTER_REGEX.containsMatchIn(it.name) }
                 .filter { !SYNTHETIC_MEMBER_REGEX.matches(it.name) }
+                .let { fns ->
+                    // TS2385: TypeScript forbids overloads of one name from having
+                    // mixed visibility. A class with a public covariant override AND
+                    // the inherited protected bridge (e.g. `clone(): Excluder` plus
+                    // `protected clone(): Object`) renders both -> mixed -> error.
+                    // Drop a PROTECTED overload when the same name also has a real
+                    // (public/internal) overload: the protected bridge isn't useful
+                    // public API and the public override is the real surface.
+                    // (PRIVATE overloads render as `// private` comments, so they
+                    // don't participate in the visibility clash and are left alone.)
+                    val list = fns.toList()
+                    val realPublicNames = list.asSequence()
+                        .filter { it.visibility != KVisibility.PROTECTED && it.visibility != KVisibility.PRIVATE }
+                        .mapTo(mutableSetOf()) { it.name }
+                    list.filterNot { it.visibility == KVisibility.PROTECTED && it.name in realPublicNames }
+                }
                 .sortedWith(compareBy({ it.name }, { it.toString() }))
                 .joinToString("") { function ->
                     val functionName = pipeline.transformFunctionName(function.name, function, klass)
