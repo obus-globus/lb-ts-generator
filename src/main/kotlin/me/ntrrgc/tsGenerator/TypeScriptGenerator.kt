@@ -919,11 +919,20 @@ class TypeScriptGenerator(
                     allCtors.any { it.visibility == KVisibility.PROTECTED } -> "protected "
                     else -> "private "
                 }
+                // Constructors can't declare type parameters in TS. Preserve the
+                // class's own parameters (map each to itself) and let fallbackToBound
+                // replace any OTHER variable a ctor signature references — a ctor-
+                // level `M`, or an enclosing class's `T` inside a nested class — with
+                // its upper bound, else it leaks as an undeclared name (TS2304).
+                val classTypeParamSelfMap = klass.typeParameters.associate { it.name to it.createType() }
                 emitCtors.joinToString("") { constructor ->
                     val parameters = constructor.parameters
                         .joinToString(", ") { param ->
-                            val paramType =
+                            val rawType =
                                 pipeline.transformFunctionParameterType(param.type, param, constructor, klass)
+                            val paramType = substituteTypeParameters(
+                                rawType, classTypeParamSelfMap, fallbackToBound = true
+                            )
                             "${param.name}: ${formatKType(paramType).formatWithoutParenthesis()}"
                         }
                     val ctorDoc = try {
