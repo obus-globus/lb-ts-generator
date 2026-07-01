@@ -251,7 +251,12 @@ class TypeScriptGenerator(
                         voidType
                     )
                 }
-                if (!shouldIgnoreSuperclass(classifier) && !isSameClass(classifier, klass)
+                // Skip anonymous/local classes ($1): they have no emitted module, so
+                // importing them resolves (via the shared null-name bucket) to an
+                // unrelated $1 class -> TS2305. nonPrimitiveFromKType renders them as
+                // their supertype/`any`, so no import is needed.
+                val isAnon = try { classifier.java.isAnonymousClass || classifier.java.isLocalClass } catch (_: Throwable) { false }
+                if (!shouldIgnoreSuperclass(classifier) && !isSameClass(classifier, klass) && !isAnon
                     && !predefinedMappings.containsKey(classifier)
                     && (classifier.qualifiedName == null
                         || !predefinedMappingsByName.containsKey(classifier.qualifiedName)))
@@ -353,6 +358,23 @@ class TypeScriptGenerator(
 
         private fun nonPrimitiveFromKType(kType: KType): String {
             val kClass = kType.classifier as KClass<*>
+
+            // Anonymous/local classes (Foo$1) have no qualifiedName and no emitted
+            // module. Rendering their binary name emits an import for a member that
+            // doesn't exist — and because every null-name class shares one lookup
+            // bucket, the import even resolves to an UNRELATED Foo$1 (TS2305). Fall
+            // back to the first real supertype (the meaningful type the anonymous
+            // class stands in for), else `any`.
+            try {
+                if (kClass.java.isAnonymousClass || kClass.java.isLocalClass) {
+                    val sup = kClass.supertypes.firstOrNull {
+                        val c = it.classifier as? KClass<*>
+                        c != null && !isSameClass(c, Any::class) && c.qualifiedName != "java.lang.Object"
+                    }
+                    return if (sup != null) formatKType(sup).formatWithoutParenthesis() else "any"
+                }
+            } catch (_: Throwable) { /* fall through to normal rendering */ }
+
             val binaryName = tsNameFor(kClass)
 
             // If the counts don't match, this might indicate a specialized type
