@@ -852,7 +852,10 @@ class TypeScriptGenerator(
                             )
                                 typeParamsNotOfClass.add(param.parameterizedType)
 
-                            "param${param.name}: ${formatKType(paramType).formatWithoutParenthesis()}"
+                            // A Java vararg is the trailing param and is callable
+                            // with spread args (as GraalJS + the LB KDoc examples do),
+                            // so emit a TS rest param `...name: T[]`, not `name: T[]`.
+                            "${if (param.isVarArgs) "..." else ""}param${param.name}: ${formatKType(paramType).formatWithoutParenthesis()}"
                         }
 
                     val visibility = when {
@@ -933,7 +936,8 @@ class TypeScriptGenerator(
                             val paramType = substituteTypeParameters(
                                 rawType, classTypeParamSelfMap, fallbackToBound = true
                             )
-                            "${param.name}: ${formatKType(paramType).formatWithoutParenthesis()}"
+                            // Kotlin vararg -> TS rest param `...name: T[]`.
+                            "${if (param.isVararg) "..." else ""}${param.name}: ${formatKType(paramType).formatWithoutParenthesis()}"
                         }
                     val ctorDoc = try {
                         kdocSource?.tsdocForFqn("${klass.qualifiedName}.<init>", "    ")
@@ -1179,7 +1183,9 @@ class TypeScriptGenerator(
                             )
                         }
                     val parameters = parameterTypes.joinToString(", ") { (param, paramType) ->
-                        "${param.name}: ${formatKType(paramType).formatWithoutParenthesis()}"
+                        // Kotlin vararg -> TS rest param `...name: T[]` (callable with
+                        // spread args, matching GraalJS + the LB KDoc examples).
+                        "${if (param.isVararg) "..." else ""}${param.name}: ${formatKType(paramType).formatWithoutParenthesis()}"
                     }
 
                     // Declare every method-level type variable the signature

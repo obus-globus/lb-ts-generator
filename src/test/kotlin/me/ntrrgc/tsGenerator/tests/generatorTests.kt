@@ -1068,3 +1068,33 @@ class Tests : StringSpec({
 
     }
 })
+
+@Suppress("unused")
+class ClassWithVararg {
+    fun log(prefix: String, vararg values: Any?) {}
+    fun noVararg(values: Array<Any?>) {}
+}
+
+class VarargTests : StringSpec({
+    "Kotlin vararg emits a TS rest parameter; a real array param does not" {
+        assertGeneratedCode(
+            ClassWithVararg::class, setOf(
+                """
+class ClassWithVararg extends Object {
+    constructor()
+    log(prefix: string, ...values: (Object | null)[]): void;
+    noVararg(values: (Object | null)[]): void;
+}
+"""
+            ),
+            any = """
+                class Object{
+                    constructor()
+                    equals(other: Object | null): boolean;
+                    hashCode(): int;
+                    toString(): string;
+                }
+            """
+        )
+    }
+})
