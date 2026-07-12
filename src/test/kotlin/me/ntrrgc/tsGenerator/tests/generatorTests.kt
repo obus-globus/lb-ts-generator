@@ -1073,6 +1073,7 @@ class Tests : StringSpec({
 class ClassWithVararg {
     fun log(prefix: String, vararg values: Any?) {}
     fun noVararg(values: Array<Any?>) {}
+    fun midVararg(vararg values: Any?, tail: String) {}
 }
 
 class VarargTests : StringSpec({
@@ -1083,6 +1084,7 @@ class VarargTests : StringSpec({
 class ClassWithVararg extends Object {
     constructor()
     log(prefix: string, ...values: (Object | null)[]): void;
+    midVararg(values: (Object | null)[], tail: string): void;
     noVararg(values: (Object | null)[]): void;
 }
 """

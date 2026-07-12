@@ -852,10 +852,15 @@ class TypeScriptGenerator(
                             )
                                 typeParamsNotOfClass.add(param.parameterizedType)
 
-                            // A Java vararg is the trailing param and is callable
-                            // with spread args (as GraalJS + the LB KDoc examples do),
-                            // so emit a TS rest param `...name: T[]`, not `name: T[]`.
-                            "${if (param.isVarArgs) "..." else ""}param${param.name}: ${formatKType(paramType).formatWithoutParenthesis()}"
+                            // A trailing Java vararg is callable with spread args (as
+                            // GraalJS + the LB KDoc examples do), so emit a TS rest
+                            // param `...name: T[]`. Only when it is genuinely the last
+                            // param AND renders as an array type - Kotlin allows a
+                            // non-last vararg (TS1014) and some varargs render as their
+                            // element type (TS2370); those keep the plain array form.
+                            val rendered = formatKType(paramType).formatWithoutParenthesis()
+                            val rest = if (param.isVarArgs && param === method.parameters.last() && rendered.endsWith("[]")) "..." else ""
+                            "${rest}param${param.name}: $rendered"
                         }
 
                     val visibility = when {
@@ -936,8 +941,12 @@ class TypeScriptGenerator(
                             val paramType = substituteTypeParameters(
                                 rawType, classTypeParamSelfMap, fallbackToBound = true
                             )
-                            // Kotlin vararg -> TS rest param `...name: T[]`.
-                            "${if (param.isVararg) "..." else ""}${param.name}: ${formatKType(paramType).formatWithoutParenthesis()}"
+                            // Kotlin vararg -> TS rest param `...name: T[]`, but only
+                            // when it is genuinely last and renders as an array type
+                            // (a non-last vararg -> TS1014, a non-array one -> TS2370).
+                            val rendered = formatKType(paramType).formatWithoutParenthesis()
+                            val rest = if (param.isVararg && param === constructor.parameters.last() && rendered.endsWith("[]")) "..." else ""
+                            "${rest}${param.name}: $rendered"
                         }
                     val ctorDoc = try {
                         kdocSource?.tsdocForFqn("${klass.qualifiedName}.<init>", "    ")
@@ -1184,8 +1193,12 @@ class TypeScriptGenerator(
                         }
                     val parameters = parameterTypes.joinToString(", ") { (param, paramType) ->
                         // Kotlin vararg -> TS rest param `...name: T[]` (callable with
-                        // spread args, matching GraalJS + the LB KDoc examples).
-                        "${if (param.isVararg) "..." else ""}${param.name}: ${formatKType(paramType).formatWithoutParenthesis()}"
+                        // spread args, matching GraalJS + the LB KDoc examples), but only
+                        // when it is genuinely last and renders as an array type (a
+                        // non-last vararg -> TS1014, a non-array one -> TS2370).
+                        val rendered = formatKType(paramType).formatWithoutParenthesis()
+                        val rest = if (param.isVararg && param === parameterTypes.last().first && rendered.endsWith("[]")) "..." else ""
+                        "${rest}${param.name}: $rendered"
                     }
 
                     // Declare every method-level type variable the signature
