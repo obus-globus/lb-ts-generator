@@ -859,7 +859,7 @@ class TypeScriptGenerator(
                             // non-last vararg (TS1014) and some varargs render as their
                             // element type (TS2370); those keep the plain array form.
                             val rendered = formatKType(paramType).formatWithoutParenthesis()
-                            val rest = if (param.isVarArgs && param === method.parameters.last() && rendered.endsWith("[]")) "..." else ""
+                            val rest = if (param.isVarArgs && param === method.parameters.last() && rendered.endsWith("[]") && !rendered.contains("=>")) "..." else ""
                             "${rest}param${param.name}: $rendered"
                         }
 
@@ -945,7 +945,7 @@ class TypeScriptGenerator(
                             // when it is genuinely last and renders as an array type
                             // (a non-last vararg -> TS1014, a non-array one -> TS2370).
                             val rendered = formatKType(paramType).formatWithoutParenthesis()
-                            val rest = if (param.isVararg && param === constructor.parameters.last() && rendered.endsWith("[]")) "..." else ""
+                            val rest = if (param.isVararg && param === constructor.parameters.last() && rendered.endsWith("[]") && !rendered.contains("=>")) "..." else ""
                             "${rest}${param.name}: $rendered"
                         }
                     val ctorDoc = try {
@@ -1197,7 +1197,7 @@ class TypeScriptGenerator(
                         // when it is genuinely last and renders as an array type (a
                         // non-last vararg -> TS1014, a non-array one -> TS2370).
                         val rendered = formatKType(paramType).formatWithoutParenthesis()
-                        val rest = if (param.isVararg && param === parameterTypes.last().first && rendered.endsWith("[]")) "..." else ""
+                        val rest = if (param.isVararg && param === parameterTypes.last().first && rendered.endsWith("[]") && !rendered.contains("=>")) "..." else ""
                         "${rest}${param.name}: $rendered"
                     }
 
