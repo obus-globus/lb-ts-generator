@@ -772,7 +772,17 @@ class TypeScriptGenerator(
                     // `constructor()` in 629 interface files (TS7010/TS1093 debt).
                     (if (klass.java.isInterface) "" else constructorsOf(klass)) +
                     propertiesOf(klass, interfaceSupertypes) +
-                    nashornBeanPropertiesOf(klass) +
+                    // A15 (Java bean-property dual) DISABLED. The per-class guards
+                    // in nashornBeanPropertiesOf cannot see the cross-hierarchy
+                    // damage: injecting e.g. `readonly attackable: boolean` onto
+                    // Entity (from isAttackable()) makes Entity's structural shape
+                    // gain a member its subtree renders incompatibly, and Entity is
+                    // used as a generic bound (`<T extends Entity>`) all over MC -
+                    // a full regen produced +84 TS2344 + TS2416 cascades. A correct
+                    // dual needs whole-hierarchy analysis (only leaf classes, never
+                    // a generic-bound type); until then the getter-method form is
+                    // the sole surface (documented property-first in the README).
+                    // nashornBeanPropertiesOf(klass) +
                     functionsOf(klass, interfaceSupertypes, klass.typeParameters) +
                     enumNameOverride +
                     "}"
@@ -1669,6 +1679,7 @@ class TypeScriptGenerator(
          *    for every Kotlin property tree-wide for a purely legacy calling
          *    convention; documented in typings/README.md instead.
          */
+        @Suppress("unused")  // A15 disabled at the call site; kept for a future whole-hierarchy-aware attempt.
         private fun nashornBeanPropertiesOf(klass: KClass<*>): String = try {
             if (klass.java.isInterface
                 || klass.java.getAnnotation(Metadata::class.java) != null

@@ -158,30 +158,19 @@ class Wave3RegressionTests : StringSpec({
         out shouldNotContain "NoStaticsList"
     }
 
-    // ---- A15: nashorn dual surface (Java side) -------------------------------
-
-    "a field-less Java getter also emits its bean property (readonly without setter)" {
+    // ---- A15: nashorn dual surface (Java side) - DISABLED --------------------
+    // The Java bean-property dual (readonly title next to getTitle()) is turned
+    // off: injecting a bean property onto a base class that is used as a generic
+    // bound (Entity) cascaded into +84 TS2344 + TS2416 across the MC hierarchy
+    // in a full regen. Only the getter-method form is emitted; a correct dual
+    // needs whole-hierarchy analysis. This test locks the disabled state in.
+    "the Java bean-property dual is NOT emitted (only the getter method)" {
         val out = live(JavaBeanDual::class)
         val classBlock = out.substringAfter("class JavaBeanDual ").substringBefore("\n}")
-        classBlock shouldContain "readonly title: string;"
-        // The method form stays callable too - that IS the dual surface.
         classBlock shouldContain "getTitle(): string;"
-        classBlock shouldContain "readonly ready: boolean;"
-    }
-
-    "a getter/setter pair emits a writable bean property" {
-        val out = live(JavaBeanDual::class)
-        val classBlock = out.substringAfter("class JavaBeanDual ").substringBefore("\n}")
-        classBlock shouldContain "    mood: string;"
-        classBlock shouldNotContain "readonly mood"
-    }
-
-    "bean injection skips names already taken by a method or a backing field" {
-        val out = live(JavaBeanDual::class)
-        val classBlock = out.substringAfter("class JavaBeanDual ").substringBefore("\n}")
-        // `value` is a real method - injecting a property would be TS2416/F7 debt.
-        classBlock shouldNotContain "readonly value: int;"
-        // `stash` already renders via the backing-field bean branch - once.
+        classBlock shouldNotContain "readonly title: string;"
+        classBlock shouldNotContain "    mood: string;"
+        // A real backing-field property still renders once via the normal path.
         classBlock.split("stash: string;").size - 1 shouldBe 1
     }
 })
