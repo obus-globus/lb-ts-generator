@@ -545,9 +545,13 @@ class TypeScriptGenerator(
             // a REFERENCE to such a type is one value, not a collection - emit
             // the nominal type. Appending [] here arrayed every Path in the
             // output (toPath(): Path[], getParent(): Path[], even
-            // Comparable<Path[]>). Classifier comparison, not KType equality:
-            // nullability/annotations on the reference must not reopen the bug.
-            return if (kType.classifier == itemType.classifier)
+            // Comparable<Path[]>). Gate on the same isSelfIterable predicate
+            // the declaration side uses (it keeps these classes a module, so
+            // the nominal name imports) - NOT on classifier equality with the
+            // element type, which misfires on shapes like List<String[]> and
+            // emits an unimported `List<string[]>` (TS2304).
+            val classifier = kType.classifier
+            return if (classifier is KClass<*> && isSelfIterable(classifier))
                 nonPrimitiveFromKType(kType)
             else
                 "${formatKType(itemType).formatWithParenthesis()}[]"

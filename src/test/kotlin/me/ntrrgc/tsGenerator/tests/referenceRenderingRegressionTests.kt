@@ -19,6 +19,14 @@ class SelfIterableHolder {
     fun parentOf(p: SelfIterableFixture): SelfIterableFixture = p
 }
 
+// NOT self-iterable: a collection whose element type is itself a container
+// shape. A naive classifier-equality check for "self-iterable" misfired here
+// (first regen attempt emitted an unimported `List<string[]>` -> TS2304).
+@Suppress("unused")
+class ListOfArraysHolder {
+    fun grid(): List<Array<String>> = emptyList()
+}
+
 private fun liveDefinitions(vararg roots: kotlin.reflect.KClass<*>): String {
     val text = TypeScriptGenerator(roots.toList(), intTypeName = "int").definitionsText
     // Commented-out members are invisible to TS - assert on live lines only.
@@ -35,6 +43,15 @@ class ReferenceRenderingRegressionTests : StringSpec({
         live shouldNotContain "SelfIterableFixture[]"
         live shouldContain "single(): SelfIterableFixture"
         live shouldContain "parentOf(p: SelfIterableFixture): SelfIterableFixture"
+    }
+
+    // The self-iterable check must be the isSelfIterable predicate, not
+    // classifier equality: List<Array<String>> is an ordinary collection and
+    // must stay an array-of-arrays, not become a nominal List<...> reference.
+    "a list of arrays still renders as a nested array" {
+        val live = liveDefinitions(ListOfArraysHolder::class)
+        live shouldContain "grid(): string[][]"
+        live shouldNotContain "List<"
     }
 
     // Enums emit as nominal classes (class X extends Enum<X>), not literal
