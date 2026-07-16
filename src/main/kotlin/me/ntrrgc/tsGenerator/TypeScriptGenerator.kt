@@ -541,9 +541,14 @@ class TypeScriptGenerator(
                     getIterableElementType(kType) ?: kType.arguments.singleOrNull()?.type ?: KotlinAnyOrNull
                 }
             }
-            // a Path is iterable and it returns Path s for subdirectories
-            return if (kType == itemType)
-                "${nonPrimitiveFromKType(kType)}[]" // can it be others like maps?
+            // Self-iterable (Path : Iterable<Path>, iterating yields subpaths):
+            // a REFERENCE to such a type is one value, not a collection - emit
+            // the nominal type. Appending [] here arrayed every Path in the
+            // output (toPath(): Path[], getParent(): Path[], even
+            // Comparable<Path[]>). Classifier comparison, not KType equality:
+            // nullability/annotations on the reference must not reopen the bug.
+            return if (kType.classifier == itemType.classifier)
+                nonPrimitiveFromKType(kType)
             else
                 "${formatKType(itemType).formatWithParenthesis()}[]"
         }
@@ -560,16 +565,16 @@ class TypeScriptGenerator(
             // unrecoverable from the erased single arg anyway.
             if (kType.arguments.size < 2) return "{ [key: string]: any }"
 
-            val rawKeyType = kType.arguments[0].type ?: KotlinAnyOrNull
-            val keyType = formatKType(rawKeyType)
+            val keyType = formatKType(kType.arguments[0].type ?: KotlinAnyOrNull)
             val valueType = formatKType(kType.arguments[1].type ?: KotlinAnyOrNull)
 
-            val isKeyEnum = (rawKeyType.classifier as? KClass<*>)?.java?.isEnum == true
-
+            // No special case for enum keys: this fork emits enums as nominal
+            // classes (class X extends Enum<X>), not literal unions, so a mapped
+            // type `{ [key in X]: V }` is invalid TS - class types are not
+            // assignable to `string | number | symbol` (TS2322 in the .d.ts
+            // itself under skipLibCheck:false). Enum-keyed maps render as
+            // Map<K, V> like every other object-keyed map.
             return when {
-                isKeyEnum ->
-                    "{ [key in ${keyType.formatWithoutParenthesis()}]: ${valueType.formatWithoutParenthesis()} }"
-
                 keyType.formatWithoutParenthesis() == "string" || keyType.formatWithoutParenthesis() == "number" ->
                     "{ [key: ${keyType.formatWithoutParenthesis()}]: ${valueType.formatWithoutParenthesis()} }"
 
