@@ -33,6 +33,7 @@ import me.commandblock2.tsGenerator.binaryName
 import me.commandblock2.tsGenerator.commentIfInvalid
 import me.commandblock2.tsGenerator.toKFunction
 import java.beans.Introspector
+import java.lang.reflect.GenericArrayType
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
 import java.lang.reflect.ParameterizedType
@@ -535,6 +536,7 @@ class TypeScriptGenerator(
                 LongArray::class -> Long::class.createType(nullable = false)
                 FloatArray::class -> Float::class.createType(nullable = false)
                 DoubleArray::class -> Double::class.createType(nullable = false)
+                BooleanArray::class -> Boolean::class.createType(nullable = false)
 
                 // Class container types (they use generics)
                 else -> {
@@ -677,8 +679,11 @@ class TypeScriptGenerator(
                             interfaceSupertypes,
                             klass.typeParameters
                         )) +
-                    constructorsOf(klass) +
-                    propertiesOf(klass) +
+                    // A5: never emit constructors inside a TS interface - kotlin-
+                    // reflect reports one for annotation classes, which produced
+                    // `constructor()` in 629 interface files (TS7010/TS1093 debt).
+                    (if (klass.java.isInterface) "" else constructorsOf(klass)) +
+                    propertiesOf(klass, interfaceSupertypes) +
                     functionsOf(klass, interfaceSupertypes, klass.typeParameters) +
                     enumNameOverride +
                     "}"
@@ -719,6 +724,17 @@ class TypeScriptGenerator(
 
 
         private fun createKotlinType(javaClass: Class<*>): KType {
+            // Reference arrays: String[].class.kotlin is Array::class (one type
+            // parameter), which the padding branch below would fill with Any? -
+            // `(Object | null)[]` instead of `string[]`. Recurse into the
+            // component type instead (handles String[][] too). Primitive arrays
+            // (int[].class -> IntArray) have no type parameters and take the
+            // normal branch; arrayFromKType maps them via its primitive table.
+            if (javaClass.isArray && !javaClass.componentType.isPrimitive) {
+                return Array::class.createType(
+                    listOf(KTypeProjection.invariant(createKotlinType(javaClass.componentType)))
+                )
+            }
             val kClass = javaClass.kotlin
             return if (kClass.typeParameters.isEmpty()) {
                 kClass.createType()
@@ -736,6 +752,18 @@ class TypeScriptGenerator(
             klass.java.fields
                 .filter { Modifier.isStatic(it.modifiers) }
                 .filter { !SYNTHETIC_MEMBER_REGEX.matches(it.name) }
+                // A4: getFields() returns inherited public constants alongside a
+                // shadowing redeclaration - both emitted = duplicate `static X`
+                // (the TS2300 debt, e.g. BlockPos.CODEC next to Vec3i.CODEC).
+                // One declaration per name; the class's own (most-specific) wins.
+                .groupBy { it.name }
+                .map { (_, fields) ->
+                    // Deterministic pick (getFields order is JVM-dependent):
+                    // the class's own declaration, else the lexicographically
+                    // first generic signature.
+                    fields.firstOrNull { it.declaringClass == klass.java }
+                        ?: fields.minByOrNull { it.toGenericString() }!!
+                }
                 .sortedWith(compareBy({ it.name }, { it.toGenericString() }))
                 .joinToString("") { field ->
                     val fieldName = field.name
@@ -797,6 +825,15 @@ class TypeScriptGenerator(
                     type.upperBounds.firstOrNull()?.let { javaTypeToKotlinType(it, substitution) }
                         ?: KotlinAnyOrNull
 
+                // T[] / List<X>[] from generic signatures (incl. the array part
+                // of varargs). Without this case they fell into the Any? catch-all,
+                // erasing the ARRAYNESS itself to a scalar `Object | null` on the
+                // whole reflection path (statics, SAMs, fields).
+                is GenericArrayType ->
+                    Array::class.createType(
+                        listOf(KTypeProjection.invariant(javaTypeToKotlinType(type.genericComponentType, substitution)))
+                    )
+
                 else -> Any::class.createType(nullable = true)
             }
         }
@@ -842,7 +879,7 @@ class TypeScriptGenerator(
                 .filter { !MIXIN_COUNTER_REGEX.containsMatchIn(it.name) }
                 .filter { !SYNTHETIC_MEMBER_REGEX.matches(it.name) }
                 .sortedWith(compareBy({ it.name }, { it.toGenericString() }))
-                .joinToString("") { method ->
+                .map { method ->
                     val methodName = method.name
                     val typeParamsNotOfClass = mutableListOf<Type>()
                     val returnType = javaTypeToKotlinType(method.genericReturnType)
@@ -890,6 +927,11 @@ class TypeScriptGenerator(
                     (methodDoc + "    static $visibility$methodName$typeParamsString($parameters): ${formatKType(returnType).formatWithoutParenthesis()};\n")
                         .commentIfInvalid()
                 }
+                // A4: distinct Java overloads (int/long, float/double) can collapse
+                // to the same rendered TS line - emit each line once. The input is
+                // sorted, so the surviving occurrence is deterministic.
+                .distinct()
+                .joinToString("")
         } catch (exception: kotlin.reflect.jvm.internal.KotlinReflectionInternalError) {
             print(exception.toString())
             ""
@@ -1263,8 +1305,66 @@ class TypeScriptGenerator(
         }
 
 
-        private fun propertiesOf(klass: KClass<*>): String = try {
-            klass.declaredMemberProperties
+        private fun propertiesOf(klass: KClass<*>, interfaceSupertypes: List<KType> = emptyList()): String = try {
+            // A3: the property analog of functionsOf's B-fix. An implementer does
+            // NOT redeclare a Kotlin interface's default `val` (it is absent from
+            // declaredMemberProperties), so the emitted class lacked runtime
+            // members like WebSocketEvent.serializer / serializeAsync and was not
+            // assignable to its own interface (the bulk of the baselined TS2420s).
+            // Same conservative rules as the method injection: NON-GENERIC
+            // interfaces only, PUBLIC, simple concrete types (no substitution
+            // needed), and skip anything the class declares itself or gets from a
+            // base class. Classes only - interfaces inherit via `extends` in TS.
+            val injectedInterfaceProperties: List<KProperty1<*, *>> =
+                if (klass.java.isInterface || interfaceSupertypes.isEmpty()) emptyList() else try {
+                    val declaredNames = klass.declaredMemberProperties.mapTo(mutableSetOf()) { it.name }
+                    val fromBaseClass: Set<String> = generateSequence(klass.java.superclass) { it.superclass }
+                        .flatMap { sc ->
+                            try { sc.kotlin.declaredMemberProperties.map { it.name } }
+                            catch (_: Throwable) { emptyList() }
+                        }.toSet()
+                    val closure = run {
+                        val out = mutableListOf<KClass<*>>()
+                        val seen = mutableSetOf<KClass<*>>()
+                        fun visit(iface: KClass<*>) {
+                            if (!seen.add(iface)) return
+                            out.add(iface)
+                            (try { iface.supertypes } catch (_: Throwable) { emptyList<KType>() })
+                                .mapNotNull { it.classifier as? KClass<*> }
+                                .filter { it.java.isInterface }
+                                .forEach { visit(it) }
+                            (try { iface.java.interfaces.toList() } catch (_: Throwable) { emptyList<Class<*>>() })
+                                .mapNotNull { try { it.kotlin } catch (_: Throwable) { null } }
+                                .forEach { visit(it) }
+                        }
+                        interfaceSupertypes
+                            .mapNotNull { it.classifier as? KClass<*> }
+                            .filter { it.java.isInterface }
+                            .forEach { visit(it) }
+                        out
+                    }
+                    fun simple(t: KType): Boolean {
+                        val c = t.classifier
+                        return c is KClass<*> && t.arguments.isEmpty() && !shouldIgnoreSuperclass(c)
+                    }
+                    val seenNames = mutableSetOf<String>()
+                    closure.asSequence()
+                        .filter { it.typeParameters.isEmpty() }
+                        .flatMap {
+                            try { it.declaredMemberProperties.asSequence() }
+                            catch (_: Throwable) { emptySequence<KProperty1<*, *>>() }
+                        }
+                        .filter { p ->
+                            p.visibility == KVisibility.PUBLIC
+                                && simple(p.returnType)
+                                && p.name !in declaredNames
+                                && p.name !in fromBaseClass
+                                && seenNames.add(p.name)
+                        }
+                        .toList()
+                } catch (_: Throwable) { emptyList() }
+
+            (klass.declaredMemberProperties + injectedInterfaceProperties)
                 .filter { !SYNTHETIC_MEMBER_REGEX.matches(it.name) }
                 .let { propertyList ->
                     pipeline.transformPropertyList(propertyList.toList(), klass)
@@ -1426,7 +1526,20 @@ class TypeScriptGenerator(
 
             return clazz.methods.find {
                 Modifier.isAbstract(it.modifiers) && !it.isDefault && !Modifier.isStatic(it.modifiers)
+                    // JLS 9.8: methods matching a public java.lang.Object method
+                    // don't count toward the SAM. java.util.Comparator redeclares
+                    // equals(Object) abstract; without this filter it wins over
+                    // compare(T,T) (clazz.methods order) and every comparator
+                    // rendered as `(param0: Object) => boolean`.
+                    && !isPublicObjectMethod(it)
             }
+        }
+
+        /** True for signatures that match a public method of java.lang.Object. */
+        private fun isPublicObjectMethod(m: Method): Boolean = when (m.name) {
+            "equals" -> m.parameterCount == 1 && m.parameterTypes[0] == java.lang.Object::class.java
+            "hashCode", "toString" -> m.parameterCount == 0
+            else -> false
         }
 
         /**
