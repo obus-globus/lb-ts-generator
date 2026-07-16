@@ -48,10 +48,11 @@ class Wave1RegressionTests : StringSpec({
     }
 
     // A2 - GenericArrayType: arrayness survives erasure; trailing vararg
-    // becomes a rest param.
+    // becomes a rest param. (Since A17, the method's own type variable is
+    // DECLARED instead of erased, so the element type is T, not Object|null.)
     "a generic vararg keeps its arrayness and rest form" {
         val out = live(StaticArrayFixtures::class)
-        out shouldContain "addAll(...paramarg0: (Object | null)[]): void;"
+        out shouldContain "addAll<T extends unknown>(...paramarg0: T[]): void;"
     }
 
     // A2 - parameterized array element renders through the normal machinery.

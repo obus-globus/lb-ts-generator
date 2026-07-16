@@ -50,6 +50,60 @@ import kotlin.reflect.jvm.javaField
 import kotlin.reflect.jvm.javaGetter
 import kotlin.reflect.jvm.javaMethod
 import kotlin.reflect.jvm.javaType
+import kotlin.reflect.jvm.kotlinFunction
+
+/**
+ * A17: minimal [KType] implementation for shapes kotlin-reflect cannot build.
+ *
+ * kotlin-reflect's `createType()` hard-casts every type argument to its own
+ * internal `KTypeImpl`, so a type argument backed by [JavaTypeVariableParameter]
+ * (a JAVA method-level type variable, which has no kotlin-reflect descriptor)
+ * throws. This carries exactly what the rendering path ([formatKType],
+ * arrayFromKType, mapFromKType, nonPrimitiveFromKType) consumes:
+ * classifier / arguments / nullability.
+ */
+internal class SyntheticKType(
+    override val classifier: KClassifier?,
+    override val arguments: List<KTypeProjection> = emptyList(),
+    override val isMarkedNullable: Boolean = false
+) : KType {
+    override val annotations: List<Annotation> = emptyList()
+    override fun toString(): String =
+        "SyntheticKType($classifier${if (arguments.isEmpty()) "" else arguments.toString()})"
+}
+
+/** A12: one rendered member overload, kept structured (instead of a flat
+ *  signature string) so return-nullability-contradictory pairs can be
+ *  collapsed before emission - see the pair-collapse note in functionsOf. */
+internal data class RenderedOverload(
+    val name: String,
+    val visibility: String,
+    val typeParams: String,
+    val parameters: String,
+    val returnType: String
+)
+
+/**
+ * A17: a [KTypeParameter] view over a java.lang.reflect.TypeVariable, so a
+ * static method's OWN generics can be DECLARED (`make<T>(param: Class<T>): T`)
+ * instead of erased to their bounds (`make(param: Class<Object>): Object | null`).
+ * [upperBounds] is lazy because an F-bounded variable (`T extends Comparable<T>`,
+ * `T extends Enum<T>`) references itself through the substitution map that is
+ * still being built when this is constructed.
+ */
+internal class JavaTypeVariableParameter(
+    typeVariable: TypeVariable<*>,
+    convert: (Type) -> KType
+) : KTypeParameter {
+    override val name: String = typeVariable.name
+    override val isReified: Boolean = false
+    override val variance: KVariance = KVariance.INVARIANT
+    override val upperBounds: List<KType> by lazy {
+        typeVariable.bounds.mapNotNull { bound ->
+            try { convert(bound) } catch (_: Throwable) { null }
+        }
+    }
+}
 
 /**
  * TypeScript definition generator.
@@ -131,7 +185,13 @@ class TypeScriptGenerator(
     // because there is no reliable way of dumping information at runtime
     // source: claude-3-5-sonnet
     inner class TypeScriptModule(
-        val klass: KClass<*>
+        val klass: KClass<*>,
+        // A14: emit ONLY the static surface (no heritage/ctors/instance
+        // members). Used for collection-shaped classes whose INSTANCES render
+        // structurally (arrays/maps) and which therefore had no module at all,
+        // leaving their static factories (ImmutableList.of, List.of, ...)
+        // unreachable for Java.type()/registry consumers.
+        private val staticsOnly: Boolean = false
     ) : GeneratedModule {
         override val path: String
 
@@ -220,7 +280,36 @@ class TypeScriptGenerator(
         }
 
         private fun generateDefinition(): String {
+            if (staticsOnly) return generateStaticsOnlyClass(klass)
             return generateInterface(klass)
+        }
+
+        /**
+         * A14: statics-only declaration for a collection-shaped class.
+         *
+         * References to such a type keep their structural rendering (`E[]`,
+         * `Map<K, V>`, index signatures) and never import this module, so no
+         * heritage, constructors or instance members are declared - only the
+         * statics a `Java.type("...")` / registry consumer reaches. Always a
+         * `class` (TS interfaces cannot hold statics, and only `export class`
+         * files receive Java.type registry entries).
+         *
+         * The class's own type parameters ARE declared: a static signature can
+         * reference the type nominally through mapFromKType (`Map.of(...):
+         * Map<K, V>`), and inside this module that name resolves to THIS
+         * declaration (shadowing e.g. the JS-global Map) - without the
+         * parameters the self-reference would be TS2315 ("not generic").
+         * Empty result (no statics) -> visitClass skips the module entirely.
+         */
+        private fun generateStaticsOnlyClass(klass: KClass<*>): String {
+            val statics = staticFieldsOf(klass) + staticMethodsOf(klass, emptyList())
+            if (statics.isBlank()) return ""
+            val templateParameters = formatTypeParameters(klass.typeParameters)
+            return "class ${klass.binaryName()}$templateParameters {\n" +
+                    "    // A14 statics-only surface: instances of this collection-backed type\n" +
+                    "    // render structurally (arrays / maps); only the statics are declared here.\n" +
+                    statics +
+                    "}"
         }
 
 
@@ -676,14 +765,14 @@ class TypeScriptGenerator(
                     (if (klass.java.isInterface) "" else
                         staticFieldsOf(klass) + staticMethodsOf(
                             klass,
-                            interfaceSupertypes,
-                            klass.typeParameters
+                            interfaceSupertypes
                         )) +
                     // A5: never emit constructors inside a TS interface - kotlin-
                     // reflect reports one for annotation classes, which produced
                     // `constructor()` in 629 interface files (TS7010/TS1093 debt).
                     (if (klass.java.isInterface) "" else constructorsOf(klass)) +
                     propertiesOf(klass, interfaceSupertypes) +
+                    nashornBeanPropertiesOf(klass) +
                     functionsOf(klass, interfaceSupertypes, klass.typeParameters) +
                     enumNameOverride +
                     "}"
@@ -817,7 +906,16 @@ class TypeScriptGenerator(
                     val typeArgs = type.actualTypeArguments.map { arg ->
                         javaTypeToKotlinType(arg, substitution)
                     }
-                    rawType.createType(typeArgs.map { KTypeProjection.invariant(it) })
+                    val projections = typeArgs.map { KTypeProjection.invariant(it) }
+                    try {
+                        rawType.createType(projections)
+                    } catch (_: Throwable) {
+                        // A17: an argument is a SyntheticKType (a declared JAVA
+                        // method-level type variable) which kotlin-reflect's
+                        // createType hard-casts and rejects; carry the shape in
+                        // a SyntheticKType instead so `Class<T>` stays `Class<T>`.
+                        SyntheticKType(rawType, projections)
+                    }
                 }
 
                 is TypeVariable<*> -> substitution[type.name] ?: eraseToBound(type)
@@ -829,10 +927,16 @@ class TypeScriptGenerator(
                 // of varargs). Without this case they fell into the Any? catch-all,
                 // erasing the ARRAYNESS itself to a scalar `Object | null` on the
                 // whole reflection path (statics, SAMs, fields).
-                is GenericArrayType ->
-                    Array::class.createType(
-                        listOf(KTypeProjection.invariant(javaTypeToKotlinType(type.genericComponentType, substitution)))
-                    )
+                is GenericArrayType -> {
+                    val component = javaTypeToKotlinType(type.genericComponentType, substitution)
+                    val projections = listOf(KTypeProjection.invariant(component))
+                    try {
+                        Array::class.createType(projections)
+                    } catch (_: Throwable) {
+                        // A17: same SyntheticKType fallback as ParameterizedType.
+                        SyntheticKType(Array::class, projections)
+                    }
+                }
 
                 else -> Any::class.createType(nullable = true)
             }
@@ -859,10 +963,26 @@ class TypeScriptGenerator(
         }
 
 
+        /**
+         * A12: resolve the Kotlin declaration behind a JVM static method
+         * (a @JvmStatic bridge on an object/companion, a file-facade top-level
+         * function, or a top-level extension function), so the DECLARED Kotlin
+         * types - crucially return/parameter nullability, which plain
+         * java.lang.reflect erases - survive into the emitted statics.
+         * Gated on the Kotlin Metadata annotation: pure-Java statics never
+         * resolve, keeping the reflect path (and its output) untouched there.
+         */
+        private fun staticKotlinDual(method: Method): KFunction<*>? = try {
+            if (method.declaringClass.getAnnotation(Metadata::class.java) != null)
+                method.kotlinFunction
+            else null
+        } catch (_: Throwable) {
+            null
+        }
+
         private fun staticMethodsOf(
             klass: KClass<*>,
-            interfaceSupertypes: List<KType>,
-            typeParameters: List<KTypeParameter>
+            interfaceSupertypes: List<KType>
         ): String = try {
             (klass.java.methods.asSequence()
                     + interfaceSupertypes.flatMap {
@@ -881,33 +1001,6 @@ class TypeScriptGenerator(
                 .sortedWith(compareBy({ it.name }, { it.toGenericString() }))
                 .map { method ->
                     val methodName = method.name
-                    val typeParamsNotOfClass = mutableListOf<Type>()
-                    val returnType = javaTypeToKotlinType(method.genericReturnType)
-
-                    if (method.genericReturnType is ParameterizedType &&
-                        !typeParameters.any { it.name == method.genericReturnType.typeName }
-                    )
-                        typeParamsNotOfClass.add(method.genericReturnType)
-
-                    val parameters = method.parameters
-                        .joinToString(", ") { param ->
-                            val paramType = javaTypeToKotlinType(param.parameterizedType)
-
-                            if (param.parameterizedType is ParameterizedType &&
-                                !typeParameters.any { it.name == param.parameterizedType.typeName }
-                            )
-                                typeParamsNotOfClass.add(param.parameterizedType)
-
-                            // A trailing Java vararg is callable with spread args (as
-                            // GraalJS + the LB KDoc examples do), so emit a TS rest
-                            // param `...name: T[]`. Only when it is genuinely the last
-                            // param AND renders as an array type - Kotlin allows a
-                            // non-last vararg (TS1014) and some varargs render as their
-                            // element type (TS2370); those keep the plain array form.
-                            val rendered = formatKType(paramType).formatWithoutParenthesis()
-                            val rest = if (param.isVarArgs && param === method.parameters.last() && rendered.endsWith("[]") && !rendered.contains("=>")) "..." else ""
-                            "${rest}param${param.name}: $rendered"
-                        }
 
                     val visibility = when {
                         Modifier.isPrivate(method.modifiers) -> "// private "
@@ -915,17 +1008,72 @@ class TypeScriptGenerator(
                         else -> ""
                     }
 
-                    val typeParamsString = typeParamsNotOfClass.map {
-                        javaTypeToKotlinType(it)
-                    }.filterIsInstance<KTypeParameter>().let {
-                        formatTypeParameters(it)
-                    }
-
                     val methodDoc = try {
                         kdocSource?.tsdocForFqn("${klass.qualifiedName}.${methodName}", "    ")
                     } catch (_: Throwable) { null } ?: ""
-                    (methodDoc + "    static $visibility$methodName$typeParamsString($parameters): ${formatKType(returnType).formatWithoutParenthesis()};\n")
-                        .commentIfInvalid()
+
+                    val kotlinDual = staticKotlinDual(method)
+                    if (kotlinDual != null) {
+                        // A12: render from the Kotlin function. Drop the INSTANCE
+                        // parameter (the object/companion a @JvmStatic bridge binds
+                        // internally - not a JVM parameter of the static), but keep
+                        // an EXTENSION_RECEIVER (it IS the first JVM parameter).
+                        // Real Kotlin parameter names come along for free.
+                        val fnParams = kotlinDual.parameters
+                            .filter { it.kind != KParameter.Kind.INSTANCE }
+                        val parameters = fnParams.joinToString(", ") { param ->
+                            val rendered = formatKType(param.type).formatWithoutParenthesis()
+                            val rest = if (param.isVararg && param === fnParams.last() && rendered.endsWith("[]") && !rendered.contains("=>")) "..." else ""
+                            "${rest}${param.name ?: "self"}: $rendered"
+                        }
+                        // A17: declare the function's own type variables (a JVM
+                        // static never sees class-level ones) so they don't leak
+                        // undeclared (TS2304).
+                        val freeParams = mutableListOf<KTypeParameter>()
+                        collectFreeTypeParameters(kotlinDual.returnType, emptyList(), freeParams)
+                        fnParams.forEach { collectFreeTypeParameters(it.type, emptyList(), freeParams) }
+                        val returnRendered = formatKType(kotlinDual.returnType).formatWithoutParenthesis()
+                        (methodDoc + "    static $visibility$methodName${formatTypeParameters(freeParams)}($parameters): $returnRendered;\n")
+                            .commentIfInvalid()
+                    } else {
+                        // A17: declare the method's OWN generics instead of erasing
+                        // them to their bounds. Before, `static <T> T make(Class<T>)`
+                        // emitted `make(param: Class<Object | null>): Object | null`
+                        // (the dead `filterIsInstance<KTypeParameter>` over KTypes
+                        // never declared anything); now it emits
+                        // `make<T>(param: Class<T>): T`. F-bounded bounds
+                        // (`T extends Enum<T>`) render legally because T is declared,
+                        // avoiding the old constraint-violating `Enum<Object>` (TS2344).
+                        val substitution = mutableMapOf<String, KType>()
+                        method.typeParameters.forEach { typeVariable ->
+                            substitution[typeVariable.name] = SyntheticKType(
+                                JavaTypeVariableParameter(typeVariable) { javaTypeToKotlinType(it, substitution) }
+                            )
+                        }
+                        val returnType = javaTypeToKotlinType(method.genericReturnType, substitution)
+
+                        val parameters = method.parameters
+                            .joinToString(", ") { param ->
+                                val paramType = javaTypeToKotlinType(param.parameterizedType, substitution)
+
+                                // A trailing Java vararg is callable with spread args (as
+                                // GraalJS + the LB KDoc examples do), so emit a TS rest
+                                // param `...name: T[]`. Only when it is genuinely the last
+                                // param AND renders as an array type - Kotlin allows a
+                                // non-last vararg (TS1014) and some varargs render as their
+                                // element type (TS2370); those keep the plain array form.
+                                val rendered = formatKType(paramType).formatWithoutParenthesis()
+                                val rest = if (param.isVarArgs && param === method.parameters.last() && rendered.endsWith("[]") && !rendered.contains("=>")) "..." else ""
+                                "${rest}param${param.name}: $rendered"
+                            }
+
+                        val typeParamsString = formatTypeParameters(
+                            method.typeParameters.mapNotNull { substitution[it.name]?.classifier as? KTypeParameter }
+                        )
+
+                        (methodDoc + "    static $visibility$methodName$typeParamsString($parameters): ${formatKType(returnType).formatWithoutParenthesis()};\n")
+                            .commentIfInvalid()
+                    }
                 }
                 // A4: distinct Java overloads (int/long, float/double) can collapse
                 // to the same rendered TS line - emit each line once. The input is
@@ -1220,7 +1368,7 @@ class TypeScriptGenerator(
                     list.filterNot { it.visibility == KVisibility.PROTECTED && it.name in realPublicNames }
                 }
                 .sortedWith(compareBy({ it.name }, { it.toString() }))
-                .joinToString("") { function ->
+                .map { function ->
                     val functionName = pipeline.transformFunctionName(function.name, function, klass)
 
                     // A function reflected off an interface supertype keeps that
@@ -1275,14 +1423,40 @@ class TypeScriptGenerator(
 
                     val typeParamString = formatTypeParameters(typeParamsNotOfClass)
 
-                    val signatureLine = "    $visibility$functionName$typeParamString($parameters): $formattedReturnType;"
+                    RenderedOverload(functionName, visibility, typeParamString, parameters, formattedReturnType)
+                }
+                .let { rendered ->
+                    // A12 (pair collapse): the W19 re-emission keys overload
+                    // identity on PARAMETERS only, so a nullable declaration and
+                    // a non-null one with identical params can coexist (e.g. a
+                    // nullable interface default next to a non-null override).
+                    // TS resolves same-param overloads by declaration order, so
+                    // whichever sorts first silently masks the other - when the
+                    // non-null form wins, a null return becomes a runtime landmine.
+                    // Collapse such pairs to the NULLABLE form (a spurious null
+                    // check is an inconvenience; a masked null is a crash).
+                    rendered.filterNot { candidate ->
+                        !candidate.returnType.endsWith(" | null") && rendered.any { other ->
+                            other !== candidate
+                                && other.name == candidate.name
+                                && other.visibility == candidate.visibility
+                                && other.typeParams == candidate.typeParams
+                                && other.parameters == candidate.parameters
+                                && (other.returnType == "${candidate.returnType} | null"
+                                    || other.returnType == "(${candidate.returnType}) | null")
+                        }
+                    }
+                }
+                .joinToString("") { overload ->
+                    val signatureLine =
+                        "    ${overload.visibility}${overload.name}${overload.typeParams}(${overload.parameters}): ${overload.returnType};"
                     if (!emittedSignatures.add(signatureLine)) {
                         // Identical rendered overload already emitted (W19 dedup).
                         ""
                     } else {
-                        val functionDoc = if (emittedFunctionFqns.add("${klass.qualifiedName}.${functionName}")) {
+                        val functionDoc = if (emittedFunctionFqns.add("${klass.qualifiedName}.${overload.name}")) {
                             try {
-                                kdocSource?.tsdocForFqn("${klass.qualifiedName}.${functionName}", "    ")
+                                kdocSource?.tsdocForFqn("${klass.qualifiedName}.${overload.name}", "    ")
                             } catch (_: Throwable) { null } ?: ""
                         } else ""
 
@@ -1471,6 +1645,134 @@ class TypeScriptGenerator(
         }
 
 
+        /**
+         * A15 (nashorn dual surface, Java side): GraalJS nashorn-compat exposes a
+         * Java getter BOTH as the method (`mc.getConnection()`) and as the bean
+         * property (`mc.connection`). kotlin-reflect only synthesizes a Java
+         * "property" when a BACKING FIELD with the bean name exists, so
+         * field-less getters were method-only and the idiomatic property read
+         * was a type error. Emit the property form for declared public instance
+         * getters whose bean name is otherwise unused.
+         *
+         * Guards - each avoids a concrete TS error class:
+         *  - only CLASSES: injecting into an interface would oblige every
+         *    implementer to carry the property (TS2420 debt, the A3 class);
+         *  - skip when the bean name is any PUBLIC METHOD name in the hierarchy
+         *    (a property overriding an inherited method is TS2416; a local
+         *    field+method of one name is fix-member-collisions.py's domain);
+         *  - skip when a property/field of that name already renders here or in
+         *    a base class or arrives via the A3 interface-property injection
+         *    (TS2300 duplicate identifier);
+         *  - Kotlin classes are skipped wholesale: their properties already
+         *    render as properties. The reverse dual (`getEventManager()` next to
+         *    `eventManager`) is intentionally NOT emitted - it would add a line
+         *    for every Kotlin property tree-wide for a purely legacy calling
+         *    convention; documented in typings/README.md instead.
+         */
+        private fun nashornBeanPropertiesOf(klass: KClass<*>): String = try {
+            if (klass.java.isInterface
+                || klass.java.getAnnotation(Metadata::class.java) != null
+            ) ""
+            else {
+                val declaredPropertyNames = try {
+                    klass.declaredMemberProperties.mapTo(mutableSetOf()) { it.name }
+                } catch (_: Throwable) { mutableSetOf<String>() }
+                // Public fields anywhere in the hierarchy render (or inherit) as
+                // properties already.
+                val fieldNames = try {
+                    klass.java.fields.mapTo(mutableSetOf()) { it.name }
+                } catch (_: Throwable) { mutableSetOf<String>() }
+                // Any public method name in the hierarchy: property-vs-method is
+                // a TS2416 across extends and an F7 collision within the class.
+                val methodNames = try {
+                    klass.java.methods.mapTo(mutableSetOf()) { it.name }
+                } catch (_: Throwable) { mutableSetOf<String>() }
+                // Base-class properties (a private field + getter in a base class
+                // already emits the bean property THERE; the subclass inherits it).
+                val basePropertyNames = generateSequence(klass.java.superclass) { it.superclass }
+                    .flatMap { superclass ->
+                        try { superclass.kotlin.declaredMemberProperties.map { it.name } }
+                        catch (_: Throwable) { emptyList() }
+                    }.toSet()
+                // A3-injected interface default properties (transitive closure).
+                val interfacePropertyNames = run {
+                    val seen = mutableSetOf<Class<*>>()
+                    val names = mutableSetOf<String>()
+                    fun visit(c: Class<*>) {
+                        c.interfaces.forEach { iface ->
+                            if (seen.add(iface)) {
+                                try {
+                                    iface.kotlin.declaredMemberProperties.forEach { names.add(it.name) }
+                                } catch (_: Throwable) { /* keep walking */ }
+                                visit(iface)
+                            }
+                        }
+                        c.superclass?.let(::visit)
+                    }
+                    try { visit(klass.java) } catch (_: Throwable) { /* best effort */ }
+                    names
+                }
+                val taken = declaredPropertyNames + fieldNames + basePropertyNames + interfacePropertyNames
+
+                // Class-level type variables stay valid in an instance member -
+                // map them to themselves so `getFoo(): T` renders as `foo: T`.
+                val classTypeParamSelfMap = klass.typeParameters.associate { it.name to it.createType() }
+
+                klass.java.declaredMethods
+                    .filter {
+                        Modifier.isPublic(it.modifiers) && !Modifier.isStatic(it.modifiers)
+                            && !it.isSynthetic && !it.isBridge
+                            && it.parameterCount == 0 && it.returnType != Void.TYPE
+                            && it.typeParameters.isEmpty()
+                            // Object.getClass() would inject `class: Class<Object>`
+                            // into Object (hence EVERY class) and pull the whole
+                            // java.lang.Class graph into every module - reflection
+                            // noise, not script surface (Java.type handles carry
+                            // `.class` via the ambient A10/F10 helper instead).
+                            && it.name != "getClass"
+                            && !MIXIN_COUNTER_REGEX.containsMatchIn(it.name)
+                            && !SYNTHETIC_MEMBER_REGEX.matches(it.name)
+                    }
+                    .mapNotNull { getter ->
+                        val n = getter.name
+                        val beanName = when {
+                            n.length > 3 && n.startsWith("get") && n[3].isUpperCase() ->
+                                Introspector.decapitalize(n.substring(3))
+                            n.length > 2 && n.startsWith("is") && n[2].isUpperCase()
+                                && getter.returnType == java.lang.Boolean.TYPE ->
+                                Introspector.decapitalize(n.substring(2))
+                            else -> null
+                        } ?: return@mapNotNull null
+                        if (beanName in taken || beanName in methodNames) return@mapNotNull null
+                        beanName to getter
+                    }
+                    // Sort BEFORE distinctBy: getDeclaredMethods order is
+                    // JVM-dependent, and two getters can map to one bean name
+                    // (`getFoo()` + `isFoo()`) - the survivor must be stable.
+                    .sortedWith(compareBy({ it.first }, { it.second.name }))
+                    .distinctBy { it.first }
+                    .joinToString("") { (beanName, getter) ->
+                        val rendered = formatKType(
+                            javaTypeToKotlinType(getter.genericReturnType, classTypeParamSelfMap)
+                        ).formatWithoutParenthesis()
+                        // Writable only when a matching public setter exists
+                        // (nashorn maps `x = v` to setX(v)).
+                        val setterName = "set" + getter.name.removePrefix("get").removePrefix("is")
+                        val hasSetter = try {
+                            klass.java.methods.any {
+                                it.name == setterName && it.parameterCount == 1
+                                    && Modifier.isPublic(it.modifiers) && !Modifier.isStatic(it.modifiers)
+                            }
+                        } catch (_: Throwable) { false }
+                        val readonly = if (hasSetter) "" else "readonly "
+                        "    $readonly$beanName: $rendered;\n".commentIfInvalid()
+                    }
+            }
+        } catch (_: Throwable) {
+            ""
+        }
+
+
         private fun formatPropertyFunctionType(type: KType): String {
             val arguments = type.arguments.dropLast(1) // Drop the return type
             val returnType =
@@ -1580,12 +1882,27 @@ class TypeScriptGenerator(
             try {
                 // Resolve the interface's type variables from the actual type
                 // arguments at this use site (positional, by declaration order).
-                val substitution: Map<String, KType> =
+                val baseSubstitution: Map<String, KType> =
                     if (kType != null && rawClass != null) {
                         rawClass.typeParameters.mapIndexedNotNull { index, typeVariable ->
                             kType.arguments.getOrNull(index)?.type?.let { typeVariable.name to it }
                         }.toMap()
                     } else emptyMap()
+
+                // A17: the SAM may be DECLARED on a generic SUPERinterface whose
+                // type variables differ from the raw class's (UnaryOperator<T>
+                // declares nothing itself; its SAM is Function<T, T>.apply(T): R).
+                // Substituting only the raw class's variables left Function's `R`
+                // to eraseToBound - `UnaryOperator<Component>` rendered as
+                // `(param0: Component) => Object | null` instead of
+                // `(param0: Component) => Component`. Re-key the substitution
+                // onto the SAM's declaring class by composing the generic
+                // supertype arguments along the inheritance path.
+                val substitution: Map<String, KType> =
+                    if (rawClass != null && sam.declaringClass != rawClass)
+                        composeSubstitutionFor(rawClass, baseSubstitution, sam.declaringClass)
+                            ?: baseSubstitution
+                    else baseSubstitution
 
                 val parameters = sam.parameters.mapIndexed { index, param ->
                     val paramType = javaTypeToKotlinType(param.parameterizedType, substitution)
@@ -1603,6 +1920,37 @@ class TypeScriptGenerator(
             } finally {
                 rawClass?.let { functionalInterfacesBeingRendered.remove(it) }
             }
+        }
+
+        /**
+         * Walks the generic supertype graph from [from] to [target], composing
+         * type-argument substitutions edge by edge, and returns a substitution
+         * keyed by [target]'s OWN type-variable names (or null if [target] is
+         * not reachable). Used to resolve a SAM declared on a superinterface
+         * of the functional interface actually referenced (see A17 above).
+         */
+        private fun composeSubstitutionFor(
+            from: Class<*>,
+            substitution: Map<String, KType>,
+            target: Class<*>
+        ): Map<String, KType>? {
+            if (from == target) return substitution
+            val supertypes = from.genericInterfaces.asList() + listOfNotNull(from.genericSuperclass)
+            for (supertype in supertypes) {
+                val (raw, args) = when (supertype) {
+                    is ParameterizedType ->
+                        (supertype.rawType as? Class<*> ?: continue) to supertype.actualTypeArguments.toList()
+                    is Class<*> -> supertype to emptyList()
+                    else -> continue
+                }
+                val next = raw.typeParameters.mapIndexed { index, typeVariable ->
+                    typeVariable.name to (args.getOrNull(index)
+                        ?.let { try { javaTypeToKotlinType(it, substitution) } catch (_: Throwable) { KotlinAnyOrNull } }
+                        ?: KotlinAnyOrNull)
+                }.toMap()
+                composeSubstitutionFor(raw, next, target)?.let { return it }
+            }
+            return null
         }
 
     }
@@ -1814,8 +2162,23 @@ class TypeScriptGenerator(
                     klass,
                     it
                 )
-            } > 0 || shouldIgnoreSuperclass(klass) || modulesByName.containsKey(moduleKeyOf(klass)))
+            } > 0 || modulesByName.containsKey(moduleKeyOf(klass)))
             return
+
+        // A14: collection-shaped classes (Iterable/Map/array-backed) used to be
+        // skipped outright - correct for their INSTANCES (rendered structurally,
+        // never imported) but it also dropped their STATIC factories
+        // (ImmutableList.of/copyOf, List.of, TreeMap statics ...) from the
+        // Java.type()/registry surface. Emit a statics-only module instead;
+        // classes without statics still produce nothing.
+        val staticsOnly = shouldIgnoreSuperclass(klass)
+        if (staticsOnly) {
+            try {
+                if (klass.javaObjectType.isArray) return // arrays: no statics
+            } catch (_: Throwable) {
+                return
+            }
+        }
 
         // Per-class resilience: a single class whose reflection fails (e.g. Kotlin
         // 2.4.0's reflect throws KotlinReflectionInternalError "could not compute
@@ -1834,11 +2197,13 @@ class TypeScriptGenerator(
         }
 
         val module = try {
-            TypeScriptModule(klass)
+            TypeScriptModule(klass, staticsOnly)
         } catch (t: Throwable) {
             println("Skipping ${klass.qualifiedName ?: klass}: ${t.javaClass.simpleName}: ${t.message}")
             return
         }
+        // A14: a statics-only candidate with no static surface emits nothing.
+        if (module.definition.isBlank()) return
         putModule(klass, module)
         module.dependentTypes.forEach { visitClass(it) }
     }
