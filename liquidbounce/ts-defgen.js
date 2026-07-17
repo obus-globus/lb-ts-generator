@@ -1,4 +1,20 @@
 /*
+ * ============================================================================
+ * SUPERSEDED — STALE ScriptHelper/Fabric-mod-era COPY
+ *
+ * The live regen driver is `tools/regen/ts-defgen.js` in the consuming repo
+ * (obus-globus/lb-script-api-types — see this repo's README, "Legacy" note).
+ * That version loads the generator classes from the jar via a child
+ * URLClassLoader and enumerates the classpath with Guava directly; the
+ * ScriptHelper/ReflectionUtil.classByName indirection used below was only
+ * needed before LiquidBounce b759cac57 (PR #8437) fixed JDK-25
+ * caller-sensitive lookups at the Truffle layer.
+ *
+ * This copy is kept ONLY so the standalone regen-raw.yml / regen-enhanced.yml
+ * workflows in this repo keep working. Do not edit it expecting to affect the
+ * canonical pipeline.
+ * ============================================================================
+ *
  * This file is part of LiquidBounce (https://github.com/CCBlueX/LiquidBounce)
  *
  * Copyright (c) 2015 - 2025 CCBlueX

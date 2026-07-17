@@ -15,8 +15,8 @@ CCBlueX as `@ccbluex/liquidbounce-script-api`.
 ## Quick legend
 
 - 🟢 **Automatic** — happens unattended on every regen, no human action required.
-- 🟡 **Manual** — applied by `patches/apply-enhancements.sh` after the regen; idempotent but explicit.
-- 🛠 **Infrastructure** — not a type-shape change, but enables the regen to run at all.
+- 🟡 **Manual** — applied by `patches/apply-enhancements.sh` after the regen; idempotent but explicit. (In the live pipeline these are subsumed by `tools/regen/post-patches.sh` in the consuming repo, as P-01'/P-02'.)
+- 🛠 **Infrastructure** — not a type-shape change, but enables the regen to run at all. **I-01/I-02 are retired** — see the note on the Infrastructure section below.
 
 ---
 
@@ -34,8 +34,8 @@ CCBlueX as `@ccbluex/liquidbounce-script-api`.
 | E-08 | `augmentations/index.d.ts` barrel file | ts-defgen (polyglot) | 🟢 Automatic |
 | P-01 | `registerScript` callable type | post-regen patch | 🟡 Manual |
 | P-02 | `registerModule` → `ScriptModule` callback | post-regen patch | 🟡 Manual |
-| I-01 | Fabric-mod-wrapped shadow jar (`fabric.mod.json` baked in) | mod packaging | 🛠 Infrastructure |
-| I-02 | `ScriptHelper.kt` + `Java.type(...)` rewrite of `ts-defgen.js` | mod + polyglot | 🛠 Infrastructure |
+| I-01 | Fabric-mod-wrapped shadow jar (`fabric.mod.json` baked in) | mod packaging | 🛠 Infrastructure (retired) |
+| I-02 | `ScriptHelper.kt` + `Java.type(...)` rewrite of `ts-defgen.js` | mod + polyglot | 🛠 Infrastructure (retired) |
 
 ---
 
@@ -216,6 +216,16 @@ CCBlueX as `@ccbluex/liquidbounce-script-api`.
 
 ## Infrastructure (enables regen to run at all under JDK 25 / GraalVM)
 
+> **RETIRED.** I-01 and I-02 describe the Fabric-mod/ScriptHelper workaround
+> that is **no longer used by the live pipeline**. LiquidBounce fixed the
+> JDK-25 caller-sensitive lookups upstream in
+> [`b759cac57`](https://github.com/CCBlueX/LiquidBounce/commit/b759cac57)
+> (PR #8437), so the canonical `tools/regen/ts-defgen.js` in the consuming
+> repo (obus-globus/lb-script-api-types) loads the generator jar via a plain
+> child `URLClassLoader` again — no mod in `run/mods/`, no `ScriptHelper`.
+> Only this repo's standalone `regen-raw.yml`/`regen-enhanced.yml` workflows
+> still exercise the flow below (see README, "Legacy" note).
+
 ### I-01 — Fabric-mod-wrapped shadow jar
 
 | Aspect | Description |
@@ -261,8 +271,8 @@ E-07  Hand-listed ambient bindings                   globalThis enumeration → 
 E-08  Orphaned augmentations/                        index.d.ts barrel written                           🟢 Auto
 P-01  registerScript: non-callable bridge class      Direct function type                                🟡 Manual
 P-02  registerModule cb: ClientModule                Cb: ScriptModule + typed descriptor                 🟡 Manual
-I-01  ts-generator.jar loaded via URLClassLoader     Loaded by Knot via fabric.mod.json                  🛠 Infra
-I-02  ts-defgen uses CS methods in polyglot          Java.type + ScriptHelper static                     🛠 Infra
+I-01  ts-generator.jar loaded via URLClassLoader     Loaded by Knot via fabric.mod.json                  🛠 Infra (retired)
+I-02  ts-defgen uses CS methods in polyglot          Java.type + ScriptHelper static                     🛠 Infra (retired)
 ```
 
 ---

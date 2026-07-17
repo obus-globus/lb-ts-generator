@@ -104,6 +104,12 @@ Three workflows live in `.github/workflows/`:
 | `regen-raw.yml` | manual only | Build the mod, clone LiquidBounce at the chosen ref, run the client headlessly under `xvfb`, and upload the raw generator output as a single zstd-compressed tarball. **No enhancement patches applied.** |
 | `regen-enhanced.yml` | manual only | Same as `regen-raw`, then runs `patches/apply-enhancements.sh` to apply P-1 (`registerScript` callable) and P-2 (`registerModule` callback typed `ScriptModule`) before packaging the artifact. |
 
+> **Note:** the two regen workflows still run the **legacy mod/ScriptHelper
+> flow** using this repo's stale copies (`liquidbounce/ts-defgen.js`,
+> `patches/apply-enhancements.sh`) — kept only as a standalone CI fallback.
+> The live pipeline (URLClassLoader jar loading, full T-series patch set) is
+> `tools/regen/` in the consuming repo, obus-globus/lb-script-api-types.
+
 The two regen workflows accept inputs:
 
 - `lb_repo` — defaults to `CCBlueX/LiquidBounce`

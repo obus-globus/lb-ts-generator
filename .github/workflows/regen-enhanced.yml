@@ -1,5 +1,12 @@
 name: Regen LB types (with enhancements)
 
+# SUPERSEDED — this workflow runs the retired Fabric-mod/ScriptHelper flow
+# with this repo's stale copies of ts-defgen.js and apply-enhancements.sh.
+# The live regen pipeline (URLClassLoader jar loading, no mod, full
+# P-01'/P-02'/T-1..T-10 patch series) is `tools/regen/` in the consuming repo,
+# obus-globus/lb-script-api-types — see README "Legacy" note. Kept only as a
+# standalone CI fallback.
+#
 # Manually trigger a full LiquidBounce script-api type regeneration using
 # the freshly-built ts-generator mod from this repo, then apply our
 # post-regen enhancement patches (P-1 registerScript callable, P-2

@@ -1,5 +1,17 @@
 #!/usr/bin/env bash
 #
+# ============================================================================
+# SUPERSEDED — legacy standalone patch set (P-1/P-2 only)
+#
+# The live post-regen patch series (P-01'/P-02' plus T-1..T-10, TSDoc
+# injection, etc.) is `tools/regen/post-patches.sh` in the consuming repo
+# (obus-globus/lb-script-api-types). The canonical ts-defgen's T-1 pass now
+# emits SAM classes (e.g. PolyglotScript$RegisterScript) as callable types
+# directly, so on current-generator output the P-1 regexes below do not match
+# and this script only partially applies (or aborts). It is kept ONLY for the
+# standalone regen-enhanced.yml workflow in this repo.
+# ============================================================================
+#
 # Apply post-regen "enhancement" patches to a regen output tree.
 #
 # These patches transform the raw output of the ts-generator into a form
