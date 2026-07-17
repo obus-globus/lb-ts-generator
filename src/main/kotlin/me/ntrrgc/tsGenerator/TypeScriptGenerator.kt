@@ -46,9 +46,11 @@ import kotlin.reflect.full.declaredMemberFunctions
 import kotlin.reflect.full.memberFunctions
 import kotlin.reflect.full.declaredMemberProperties
 import kotlin.reflect.full.withNullability
+import kotlin.reflect.jvm.javaConstructor
 import kotlin.reflect.jvm.javaField
 import kotlin.reflect.jvm.javaGetter
 import kotlin.reflect.jvm.javaMethod
+import kotlin.reflect.jvm.javaSetter
 import kotlin.reflect.jvm.javaType
 import kotlin.reflect.jvm.kotlinFunction
 
@@ -80,7 +82,9 @@ internal data class RenderedOverload(
     val visibility: String,
     val typeParams: String,
     val parameters: String,
-    val returnType: String
+    val returnType: String,
+    // A17-N2: suspend overloads carry a discoverability remark at emission.
+    val isSuspend: Boolean = false
 )
 
 /**
@@ -223,18 +227,23 @@ class TypeScriptGenerator(
         override val moduleText: String by lazy {
             val depth = path.count { it == '/' }
 
-            dependentTypes.sortedBy { it.qualifiedName ?: it.simpleName ?: "" }.mapNotNull {
+            dependentTypes.sortedBy { it.qualifiedName ?: it.simpleName ?: "" }.map {
+                val name = it.binaryName()
+                val alias = typeAliases[it]
                 // A dependent type may have no emitted module (it was skipped, e.g. a
-                // class whose reflection failed under Kotlin 2.4.0). Skip its import
-                // rather than asserting (`!!`) a module exists -- a dangling name is no
-                // worse than aborting. Computed lazily after every module is built, so
-                // the skip is order-independent.
-                val mod = modulesByName[moduleKeyOf(it)] ?: return@mapNotNull null
+                // class whose reflection failed under Kotlin 2.4.0). Computed lazily
+                // after every module is built, so the check is order-independent.
+                // A17-N4: the old behavior silently dropped the IMPORT while the
+                // already-rendered NAME stayed in the definition body — a dangling
+                // identifier (TS2304, masked only by consumers' skipLibCheck; the
+                // shipped BoundMethodHandle$Specializer ctor param). Emit a local
+                // `type X = any` alias instead: legal TS, and the name resolves
+                // honestly as an unknown type.
+                val mod = modulesByName[moduleKeyOf(it)]
+                    ?: return@map "type ${alias ?: name} = any; // A17-N4: dependency has no emitted module (skipped); aliased so the name resolves"
                 val upLevels = "../".repeat(depth)
                 val downPath = mod.path.removePrefix("/")
 
-                val name = it.binaryName()
-                val alias = typeAliases[it]
                 val imported = if (alias != null) "$name as $alias" else name
                 "import type { $imported } from '$upLevels$downPath'"
             }.joinToString("\n", postfix = "\n") { it } + "export " + definition
@@ -302,7 +311,7 @@ class TypeScriptGenerator(
          * Empty result (no statics) -> visitClass skips the module entirely.
          */
         private fun generateStaticsOnlyClass(klass: KClass<*>): String {
-            val statics = staticFieldsOf(klass) + staticMethodsOf(klass, emptyList())
+            val statics = staticFieldsOf(klass) + staticMethodsOf(klass)
             if (statics.isBlank()) return ""
             val templateParameters = formatTypeParameters(klass.typeParameters)
             return "class ${klass.binaryName()}$templateParameters {\n" +
@@ -345,7 +354,13 @@ class TypeScriptGenerator(
                 // importing them resolves (via the shared null-name bucket) to an
                 // unrelated $1 class -> TS2305. nonPrimitiveFromKType renders them as
                 // their supertype/`any`, so no import is needed.
-                val isAnon = try { classifier.java.isAnonymousClass || classifier.java.isLocalClass } catch (_: Throwable) { false }
+                // A17-N4: also skip ACC_SYNTHETIC classes - javac's constructor
+                // access-tag classes (BestCandidateSampling$1) are synthetic but
+                // NOT anonymous/local (null EnclosingMethod method ref), so they
+                // slipped this guard and got imported/emitted as bogus modules.
+                val isAnon = try {
+                    classifier.java.isAnonymousClass || classifier.java.isLocalClass || classifier.java.isSynthetic
+                } catch (_: Throwable) { false }
                 if (!shouldIgnoreSuperclass(classifier) && !isSameClass(classifier, klass) && !isAnon
                     && !predefinedMappings.containsKey(classifier)
                     && (classifier.qualifiedName == null
@@ -455,15 +470,28 @@ class TypeScriptGenerator(
             // bucket, the import even resolves to an UNRELATED Foo$1 (TS2305). Fall
             // back to the first real supertype (the meaningful type the anonymous
             // class stands in for), else `any`.
-            try {
-                if (kClass.java.isAnonymousClass || kClass.java.isLocalClass) {
+            // A17-N4: (a) ACC_SYNTHETIC classes (javac ctor access tags, lambda
+            // hidden classes) match the guard too — they are neither anonymous nor
+            // local, so they used to fall through and emit a raw binary name;
+            // (b) detection and fallback are now SEPARATE try-scopes: a class that
+            // matched the guard but whose kotlin-reflect `.supertypes` throws must
+            // render `any`, NEVER the raw binary name (the old single try swallowed
+            // the throw and fell through to exactly that — the shipped dangling
+            // `ExecutionSequencer$1` ctor params, TS2304 under skipLibCheck:false).
+            val isAnonOrSynthetic = try {
+                kClass.java.isAnonymousClass || kClass.java.isLocalClass || kClass.java.isSynthetic
+            } catch (_: Throwable) { false }
+            if (isAnonOrSynthetic) {
+                return try {
                     val sup = kClass.supertypes.firstOrNull {
                         val c = it.classifier as? KClass<*>
                         c != null && !isSameClass(c, Any::class) && c.qualifiedName != "java.lang.Object"
                     }
-                    return if (sup != null) formatKType(sup).formatWithoutParenthesis() else "any"
+                    if (sup != null) formatKType(sup).formatWithoutParenthesis() else "any"
+                } catch (_: Throwable) {
+                    "any"
                 }
-            } catch (_: Throwable) { /* fall through to normal rendering */ }
+            }
 
             val binaryName = tsNameFor(kClass)
 
@@ -762,11 +790,15 @@ class TypeScriptGenerator(
             } else ""
 
             return classDoc + "$typeKeyword ${klass.binaryName()}$templateParameters$extendsString{\n" +
+                    // A17-N3: statics come from klass.java.methods ONLY - the old
+                    // interfaceSupertypes merge copied interface statics onto every
+                    // implementer, but Java interface static METHODS are not
+                    // inherited (JLS 8.4.8): Java.type('...MutableComponent')
+                    // .literal(...) fails at runtime despite the typing. Interface
+                    // CONSTANTS (fields) genuinely are inherited and keep flowing
+                    // through staticFieldsOf (klass.java.fields includes them).
                     (if (klass.java.isInterface) "" else
-                        staticFieldsOf(klass) + staticMethodsOf(
-                            klass,
-                            interfaceSupertypes
-                        )) +
+                        staticFieldsOf(klass) + staticMethodsOf(klass)) +
                     // A5: never emit constructors inside a TS interface - kotlin-
                     // reflect reports one for annotation classes, which produced
                     // `constructor()` in 629 interface files (TS7010/TS1093 debt).
@@ -990,21 +1022,11 @@ class TypeScriptGenerator(
             null
         }
 
-        private fun staticMethodsOf(
-            klass: KClass<*>,
-            interfaceSupertypes: List<KType>
-        ): String = try {
-            (klass.java.methods.asSequence()
-                    + interfaceSupertypes.flatMap {
-                val methods = if (it.classifier is KClass<*>)
-                    (it.classifier as KClass<*>).java.methods
-                else
-                    emptyArray<Method>()
-
-                methods.toList()
-            }.asSequence()
-                    )
-
+        // A17-N3: no interfaceSupertypes parameter - see the call-site note in
+        // generateDefinition. klass.java.methods already follows the Java
+        // inheritance rule (interface statics excluded), so it is the sole source.
+        private fun staticMethodsOf(klass: KClass<*>): String = try {
+            klass.java.methods.asSequence()
                 .filter { Modifier.isStatic(it.modifiers) }
                 .filter { !MIXIN_COUNTER_REGEX.containsMatchIn(it.name) }
                 .filter { !SYNTHETIC_MEMBER_REGEX.matches(it.name) }
@@ -1111,7 +1133,30 @@ class TypeScriptGenerator(
                 // Force early class loading to trigger any NoClassDefFoundError
                 klass.java.declaredConstructors
 
-                val allCtors = klass.constructors.sortedBy { it.toString() }
+                // A17-N4: drop ACC_SYNTHETIC constructors. These are compiler
+                // bookkeeping, uncallable as written: kotlinc's default-args
+                // bridge `(..., int mask, DefaultConstructorMarker)` (shipped in
+                // 170 files when kotlin-reflect falls back to Java reflection),
+                // javac's private-ctor access bridges taking a `Foo$1` tag class
+                // (the dangling-`$1`-import sites), and kotlinc's value-class
+                // mangled ctors. @JvmOverloads reduced-arity ctors are NOT
+                // synthetic and are unaffected (A11 plan, verified via javap).
+                val ctorCandidates = klass.constructors
+                val allCtors = ctorCandidates
+                    .filterNot { c ->
+                        try { c.javaConstructor?.isSynthetic == true } catch (_: Throwable) { false }
+                    }
+                    .sortedBy { it.toString() }
+                if (allCtors.isEmpty() && ctorCandidates.isNotEmpty()) {
+                    // A17-N4 sentinel: the class HAD constructors but every one was
+                    // synthetic. Emitting nothing would imply a default PUBLIC
+                    // `constructor()` in TS. PROTECTED (not private!) blocks external
+                    // `new` while still allowing subclasses to extend — a `private
+                    // constructor()` here throws TS2675 on every emitted subclass
+                    // (e.g. LazyJavaScope / FunctionTypeKind ARE extended in-tree;
+                    // scratch-verified with the repo's tsc).
+                    "    protected constructor()\n"
+                } else {
                 // TypeScript forbids mixed visibility across overloads of the same
                 // member (TS2385), but a Java class routinely has e.g. a public AND
                 // a private constructor. Normalize:
@@ -1143,8 +1188,16 @@ class TypeScriptGenerator(
                 // its upper bound, else it leaks as an undeclared name (TS2304).
                 val classTypeParamSelfMap = klass.typeParameters.associate { it.name to it.createType() }
                 emitCtors.joinToString("") { constructor ->
-                    val parameters = constructor.parameters
-                        .joinToString(", ") { param ->
+                    // A11 (constructor rider): a trailing run of Kotlin-defaulted
+                    // params whose @JvmOverloads reduced-arity ctors exist in
+                    // bytecode renders optional (`a?:`) — `new Color4b(r, g, b)`
+                    // was a shipped type error despite the 3-arg ctor existing.
+                    // Same double gate as the instance-method path (see helper).
+                    val ctorParams = constructor.parameters
+                    val droppable = jvmDroppableTrailingCtorParams(klass, constructor)
+                    val firstOptional = ctorParams.size - droppable
+                    val parameters = ctorParams.withIndex()
+                        .joinToString(", ") { (index, param) ->
                             val rawType =
                                 pipeline.transformFunctionParameterType(param.type, param, constructor, klass)
                             val paramType = substituteTypeParameters(
@@ -1154,8 +1207,11 @@ class TypeScriptGenerator(
                             // when it is genuinely last and renders as an array type
                             // (a non-last vararg -> TS1014, a non-array one -> TS2370).
                             val rendered = formatKType(paramType).formatWithoutParenthesis()
-                            val rest = if (param.isVararg && param === constructor.parameters.last() && rendered.endsWith("[]") && !rendered.contains("=>")) "..." else ""
-                            "${rest}${param.name}: $rendered"
+                            val rest = if (param.isVararg && param === ctorParams.last() && rendered.endsWith("[]") && !rendered.contains("=>")) "..." else ""
+                            // A rest param cannot also be optional (TS1047); moot in
+                            // practice (Kotlin varargs can't have defaults) but cheap.
+                            val optional = if (index >= firstOptional && rest.isEmpty()) "?" else ""
+                            "${rest}${param.name}${optional}: $rendered"
                         }
                     val ctorDoc = try {
                         kdocSource?.tsdocForFqn("${klass.qualifiedName}.<init>", "    ")
@@ -1163,6 +1219,7 @@ class TypeScriptGenerator(
                     (ctorDoc + "    ${uniformVisibility}constructor($parameters)\n")
                         .commentIfInvalid()
                 }
+                } // end A17-N4 sentinel else (body kept unindented to keep the diff reviewable)
             } catch (e: Throwable) {
                 // This will catch all exceptions including NoClassDefFoundError and lower-level
                 // reflection errors like the one you're experiencing
@@ -1400,14 +1457,30 @@ class TypeScriptGenerator(
                                 substitution
                             )
                         }
-                    val parameters = parameterTypes.joinToString(", ") { (param, paramType) ->
+                    // A11: a trailing run of Kotlin-defaulted params whose
+                    // @JvmOverloads reduced-arity JVM overloads actually exist in
+                    // bytecode renders optional (`radix?: number`). Both gates
+                    // (isOptional AND bytecode existence) are required - see the
+                    // helper. Suspend functions never qualify (their javaMethod
+                    // carries a trailing Continuation, failing the alignment
+                    // guard), so no `?` can precede the N2 $completion param
+                    // (TS1016 "required after optional" is impossible here).
+                    val droppable = jvmDroppableTrailingParams(klass, function)
+                    val firstOptional = parameterTypes.size - droppable
+                    val parameters = parameterTypes.withIndex().joinToString(", ") { (index, paramPair) ->
+                        val (param, paramType) = paramPair
                         // Kotlin vararg -> TS rest param `...name: T[]` (callable with
                         // spread args, matching GraalJS + the LB KDoc examples), but only
                         // when it is genuinely last and renders as an array type (a
                         // non-last vararg -> TS1014, a non-array one -> TS2370).
+                        // A17-N2: never for suspend functions - the $completion param
+                        // appended below would follow the rest param (TS1014).
                         val rendered = formatKType(paramType).formatWithoutParenthesis()
-                        val rest = if (param.isVararg && param === parameterTypes.last().first && rendered.endsWith("[]") && !rendered.contains("=>")) "..." else ""
-                        "${rest}${param.name}: $rendered"
+                        val rest = if (param.isVararg && param === parameterTypes.last().first && rendered.endsWith("[]") && !rendered.contains("=>") && !function.isSuspend) "..." else ""
+                        // A rest param cannot also be optional (TS1047); moot in
+                        // practice (Kotlin varargs can't have defaults) but cheap.
+                        val optional = if (index >= firstOptional && rest.isEmpty()) "?" else ""
+                        "${rest}${param.name}${optional}: $rendered"
                     }
 
                     // Declare every method-level type variable the signature
@@ -1429,11 +1502,43 @@ class TypeScriptGenerator(
                     }
 
 
-                    val formattedReturnType = formatKType(returnType).formatWithoutParenthesis()
+                    // A17-N2: render `suspend` functions honestly. The JVM method is
+                    // `name(..., Continuation<? super T>): Object` - the KFunction
+                    // view (no continuation, declared return) typed a call form
+                    // (`module.enabledEffect()`) that fails at runtime with "no
+                    // applicable overload". Append the real trailing parameter and
+                    // return `any` (result or COROUTINE_SUSPENDED), matching what
+                    // the Java-reflection static path already emits for suspend
+                    // bytecode. NOT a Promise (GraalJS does not bridge suspend to
+                    // promises) and NOT omitted (the member exists and is callable
+                    // with a {context, resumeWith} continuation object).
+                    val isSuspend = function.isSuspend
+                    val finalParameters = if (isSuspend) {
+                        val continuationKType = try {
+                            kotlin.coroutines.Continuation::class.createType(
+                                listOf(KTypeProjection.invariant(returnType))
+                            )
+                        } catch (_: Throwable) {
+                            // returnType not kotlin-reflect-backed (SyntheticKType):
+                            // carry the same shape through the synthetic carrier.
+                            SyntheticKType(
+                                kotlin.coroutines.Continuation::class,
+                                listOf(KTypeProjection.invariant(returnType))
+                            )
+                        }
+                        // formatKType registers the Continuation import via
+                        // dependentTypes for free.
+                        val renderedContinuation = formatKType(continuationKType).formatWithoutParenthesis()
+                        (if (parameters.isEmpty()) "" else "$parameters, ") +
+                            "\$completion: $renderedContinuation"
+                    } else parameters
+
+                    val formattedReturnType =
+                        if (isSuspend) "any" else formatKType(returnType).formatWithoutParenthesis()
 
                     val typeParamString = formatTypeParameters(typeParamsNotOfClass)
 
-                    RenderedOverload(functionName, visibility, typeParamString, parameters, formattedReturnType)
+                    RenderedOverload(functionName, visibility, typeParamString, finalParameters, formattedReturnType, isSuspend)
                 }
                 .let { rendered ->
                     // A12 (pair collapse): the W19 re-emission keys overload
@@ -1470,7 +1575,13 @@ class TypeScriptGenerator(
                             } catch (_: Throwable) { null } ?: ""
                         } else ""
 
-                        (functionDoc + signatureLine + "\n").commentIfInvalid()
+                        // A17-N2: one-line remark so the unusual $completion
+                        // calling convention is discoverable at the signature.
+                        val suspendRemark = if (overload.isSuspend)
+                            "    /** Kotlin `suspend` function: pass a Continuation ({ context, resumeWith }) as the final argument; returns the result or COROUTINE_SUSPENDED. */\n"
+                        else ""
+
+                        (functionDoc + suspendRemark + signatureLine + "\n").commentIfInvalid()
                     }
                 }
             } catch (exception: kotlin.reflect.jvm.internal.KotlinReflectionInternalError) {
@@ -1606,6 +1717,60 @@ class TypeScriptGenerator(
                                 add(
                                     (propDoc + "    ${transformedPropertyName}: $formattedPropertyType;\n").commentIfInvalid()
                                 )
+                            }
+
+                            // A17-N1: when a METHOD shares the property's name
+                            // (TagEntityEvent: `val color` next to `fun color(col,
+                            // priority)`), the emitted field+method duo is invalid
+                            // TS and F7 (fix-member-collisions.py) resolves it by
+                            // DROPPING the field - correct for the bare name
+                            // (GraalJS resolves it to the method) but it erased the
+                            // property surface entirely: the value is reachable
+                            // only via the bean getter, which was never emitted.
+                            // Emit the getter (and, for mutable props, setter)
+                            // dual so it survives F7. Only the collision case, to
+                            // avoid tree-wide getter noise; only the generator can
+                            // do this (F7 sees text and can't know a getter exists).
+                            //
+                            // NAME-based comparison, not identity: getMethods()
+                            // returns fresh Method copies per call, so an
+                            // `it !== property.javaGetter` guard is dead code (and
+                            // silently misfires on @get:JvmName-renamed getters).
+                            // The getter is null-checked (never `!!`) and the block
+                            // has its own narrow catch: propertiesOf's broad
+                            // catches return "", so an exception escaping here
+                            // would silently delete EVERY property of the class.
+                            try {
+                                val collisionGetter = property.javaGetter
+                                if (collisionGetter != null && Modifier.isPublic(collisionGetter.modifiers)) {
+                                    val shadowedByMethod = klass.java.methods.any { m ->
+                                        m.name == property.name
+                                            && !(m.name == collisionGetter.name
+                                                && m.parameterCount == collisionGetter.parameterCount)
+                                    }
+                                    if (shadowedByMethod) {
+                                        // Regen-triage breadcrumb: enumerate every added
+                                        // getter so the baseline review can audit them
+                                        // (adversarial-review A17 hole 3).
+                                        println("A17-N1: ${klass.qualifiedName}: property '${property.name}' shadowed by a same-name method; emitting ${collisionGetter.name}() dual")
+                                        add(
+                                            "    ${collisionGetter.name}(): $formattedPropertyType;\n"
+                                                .commentIfInvalid()
+                                        )
+                                        if (property is KMutableProperty1<*, *>) {
+                                            val collisionSetter = try { property.javaSetter } catch (_: Throwable) { null }
+                                            if (collisionSetter != null && Modifier.isPublic(collisionSetter.modifiers)) {
+                                                add(
+                                                    "    ${collisionSetter.name}(value: $formattedPropertyType): void;\n"
+                                                        .commentIfInvalid()
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            } catch (_: Throwable) {
+                                // A17-N1 is purely additive - never let it take the
+                                // property line (or the class's other properties) down.
                             }
                         } else {
                             // Fallback to existing field/getter generation for non-bean properties
@@ -2122,6 +2287,81 @@ class TypeScriptGenerator(
          * Used by W19 to tell an override from a distinct sibling overload. */
         private fun overloadSignature(f: KFunction<*>): String =
             f.name + "(" + f.parameters.drop(1).joinToString(",") { it.type.toString() } + ")"
+
+        /**
+         * A11: how many trailing parameters of [function] can be omitted at the
+         * JVM level, i.e. a @JvmOverloads reduced-arity overload exists in
+         * bytecode for every arity down to n - result. 0 disables the feature
+         * for this function.
+         *
+         * Double gate — BOTH halves are required:
+         *  - `isOptional` alone would be WRONG: a Kotlin default WITHOUT
+         *    @JvmOverloads produces no reduced-arity JVM method (only the
+         *    filtered `$default` bridge); GraalJS matches host calls by arity,
+         *    so blanket `?` would type-launder real runtime errors (every data
+         *    class `copy()` must stay full-arity).
+         *  - bytecode existence alone would fire on every hand-written
+         *    telescoping Java overload pair tree-wide, churning thousands of
+         *    lines for zero information (the shorter overload already emits as
+         *    its own signature).
+         * The same-return prefix-typed match kills the dangerous false positive
+         * (a hand-written reduced-arity overload with a DIFFERENT return must
+         * keep resolving to its own emitted signature).
+         *
+         * The alignment guard (`parameterCount != valueParams.size`) also
+         * excludes suspend functions (their javaMethod carries a trailing
+         * Continuation) and receiver-shifted shapes (member extension fns).
+         */
+        private fun jvmDroppableTrailingParams(klass: KClass<*>, function: KFunction<*>): Int {
+            val valueParams = function.parameters.drop(1)          // matches the render loop
+            if (valueParams.none { it.isOptional }) return 0        // fast path: no defaults
+            val jm = try { function.javaMethod } catch (_: Throwable) { null } ?: return 0
+            if (jm.parameterCount != valueParams.size) return 0
+            val fullTypes = jm.parameterTypes
+            val methods = try { klass.java.methods } catch (_: Throwable) { return 0 }
+            var droppable = 0
+            for (i in valueParams.indices.reversed()) {
+                if (!valueParams[i].isOptional) break                // only a contiguous trailing run
+                val reducedArity = i
+                val exists = methods.any { m ->
+                    m.name == jm.name
+                        && m.parameterCount == reducedArity
+                        && m.returnType == jm.returnType
+                        && !m.isSynthetic
+                        && m.parameterTypes.contentEquals(fullTypes.copyOfRange(0, reducedArity))
+                }
+                if (!exists) break
+                droppable++
+            }
+            return droppable
+        }
+
+        /** A11 (constructor rider): same double gate as
+         * [jvmDroppableTrailingParams], against `klass.java.constructors` —
+         * `new Color4b(r, g, b)` (a=255 default via `@JvmOverloads
+         * constructor`) was a shipped type error. No return-type guard needed
+         * (all ctors "return" the class); synthetic ctors (default-args
+         * bridges, N4) are excluded from the existence check. */
+        private fun jvmDroppableTrailingCtorParams(klass: KClass<*>, constructor: KFunction<*>): Int {
+            val valueParams = constructor.parameters                // ctor KFunctions have no receiver
+            if (valueParams.none { it.isOptional }) return 0
+            val jc = try { constructor.javaConstructor } catch (_: Throwable) { null } ?: return 0
+            if (jc.parameterCount != valueParams.size) return 0     // e.g. inner-class outer ref
+            val fullTypes = jc.parameterTypes
+            val ctors = try { klass.java.constructors } catch (_: Throwable) { return 0 }
+            var droppable = 0
+            for (i in valueParams.indices.reversed()) {
+                if (!valueParams[i].isOptional) break
+                val exists = ctors.any { c ->
+                    c.parameterCount == i
+                        && !c.isSynthetic
+                        && c.parameterTypes.contentEquals(fullTypes.copyOfRange(0, i))
+                }
+                if (!exists) break
+                droppable++
+            }
+            return droppable
+        }
         // Matches kotlin.Function0 .. kotlin.Function22 (the arity-specific
         // function-type classes kotlin-reflect reports as the classifier).
         private val FUNCTION_CLASS_NAME = Regex("""kotlin\.Function\d+""")
@@ -2142,11 +2382,12 @@ class TypeScriptGenerator(
         //   {name}$default                                            — default-args bridge
         //   {name}$annotations                                        — synthetic annotation holder
         //   ${prefix}$inlined${suffix}                                 — inline-function lambda capture
+        //   {name}$suspendImpl                                         — open-suspend-fn static bridge (A17-N2)
         //
         // Keep tight: only filter names that match the recognised compiler-synthetic
         // shape, not arbitrary names that happen to contain `$`.
         private val SYNTHETIC_MEMBER_REGEX = Regex(
-            "^(access[\$].*|.*[\$]default|.*[\$]annotations|.*[\$]inlined[\$].*)$"
+            "^(access[\$].*|.*[\$]default|.*[\$]annotations|.*[\$]inlined[\$].*|.*[\$]suspendImpl)$"
         )
 
         fun isJavaBeanProperty(kProperty: KProperty<*>, klass: KClass<*>): Boolean {
