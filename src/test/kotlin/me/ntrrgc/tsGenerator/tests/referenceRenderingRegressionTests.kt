@@ -57,11 +57,14 @@ class ReferenceRenderingRegressionTests : StringSpec({
     // Enums emit as nominal classes (class X extends Enum<X>), not literal
     // unions, so the old `{ [key in Direction]: V }` mapped type was invalid
     // TS (a class type is not assignable to string|number|symbol - a hard
-    // error in the .d.ts under skipLibCheck:false). Enum-keyed maps must take
-    // the object-keyed Map<K, V> branch like any other non-primitive key.
-    "an enum-keyed map renders as Map<K, V>, not an invalid mapped type" {
+    // error in the .d.ts under skipLibCheck:false). Enum-keyed maps must not
+    // take a mapped-type form. A13: like every other map they now render as
+    // the synthetic JavaMap<K, V> (previously the JS-global Map<K, V>, a
+    // real lib type whose entire API is wrong on a GraalJS host map).
+    "an enum-keyed map renders as JavaMap<K, V>, not an invalid mapped type" {
         val live = liveDefinitions(ClassWithEnumMap::class)
         live shouldNotContain "[key in"
-        live shouldContain "Map<Direction, string>"
+        live shouldContain "JavaMap<Direction, string>"
+        live shouldNotContain ": Map<Direction"
     }
 })

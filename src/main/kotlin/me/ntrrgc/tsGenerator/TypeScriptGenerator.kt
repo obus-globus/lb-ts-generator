@@ -216,6 +216,15 @@ class TypeScriptGenerator(
         // runs from init, and Kotlin initializes properties in declaration order.
         private val functionalInterfacesBeingRendered = mutableSetOf<Class<*>>()
 
+        // A13: set by mapFromKType when any Map reference rendered as
+        // `JavaMap<...>`; moduleText then imports the synthetic root-level
+        // JavaMap module. Idempotent across the W12b second render pass.
+        // NOTE: like functionalInterfacesBeingRendered, must be declared
+        // BEFORE the init block (generateDefinition() runs from init and
+        // Kotlin initializes properties in declaration order — declared
+        // later, the `= false` initializer would clobber the flag).
+        private var usesJavaMap = false
+
         /** The TS name to reference [kClass] by in this module — its alias if
          * it collided with another import (or this class's own name), else its
          * simple binary name. */
@@ -227,7 +236,19 @@ class TypeScriptGenerator(
         override val moduleText: String by lazy {
             val depth = path.count { it == '/' }
 
-            dependentTypes.sortedBy { it.qualifiedName ?: it.simpleName ?: "" }.map {
+            // A13: a module that rendered any Map reference imports the
+            // synthetic JavaMap module from the types/ root (same relative
+            // depth computation as the dependent-type imports below). The
+            // flag may over-fire on a speculative formatKType evaluation
+            // whose rendered string was later deduped/discarded — an unused
+            // import is harmless in a .d.ts and Part C of the typecheck gate
+            // only requires the specifier to resolve.
+            val javaMapImport = if (usesJavaMap)
+                "import type { JavaMap } from '${"../".repeat(depth)}$JAVA_MAP_MODULE_PATH'\n"
+            else
+                ""
+
+            javaMapImport + dependentTypes.sortedBy { it.qualifiedName ?: it.simpleName ?: "" }.map {
                 val name = it.binaryName()
                 val alias = typeAliases[it]
                 // A dependent type may have no emitted module (it was skipped, e.g. a
@@ -259,7 +280,12 @@ class TypeScriptGenerator(
             // types (and against this class's own name) by aliasing the losing
             // ones, then regenerate so both imports and references use the
             // disambiguated names. Only collision files pay the second pass.
-            val used = mutableSetOf(klass.binaryName())
+            // A13: "JavaMap" is seeded unconditionally (the flag isn't final
+            // until after the first render pass) so a dependent class with
+            // that simple name would be aliased to JavaMap_2 instead of
+            // colliding with the synthetic import. No such class exists today
+            // (only JavaMapPaletteUtil, a different name).
+            val used = mutableSetOf(klass.binaryName(), "JavaMap")
             dependentTypes.sortedBy { it.qualifiedName ?: it.binaryName() }.forEach { dep ->
                 val name = dep.binaryName()
                 if (name in used) {
@@ -303,11 +329,17 @@ class TypeScriptGenerator(
          * `class` (TS interfaces cannot hold statics, and only `export class`
          * files receive Java.type registry entries).
          *
-         * The class's own type parameters ARE declared: a static signature can
+         * The class's own type parameters ARE declared: static generic
+         * signatures can reference them, and (pre-A13) a static could
          * reference the type nominally through mapFromKType (`Map.of(...):
-         * Map<K, V>`), and inside this module that name resolves to THIS
-         * declaration (shadowing e.g. the JS-global Map) - without the
-         * parameters the self-reference would be TS2315 ("not generic").
+         * Map<K, V>`), resolving to THIS declaration by shadowing the
+         * JS-global Map — without the parameters that self-reference was
+         * TS2315 ("not generic"). A13: mapFromKType now emits the imported
+         * `JavaMap<K, V>` instead, so the shadow self-reference no longer
+         * occurs for maps; the declared parameters are kept (still used by
+         * the static generic signatures, and MORE truthful for `Map.of(...)`:
+         * the returned instance has the instance surface this statics-only
+         * class deliberately lacks).
          * Empty result (no statics) -> visitClass skips the module entirely.
          */
         private fun generateStaticsOnlyClass(klass: KClass<*>): String {
@@ -679,32 +711,32 @@ class TypeScriptGenerator(
         // https://github.com/ntrrgc/ts-generator/pull/39/files#diff-15868d315697c109f701fa6b29d6b1beaabb6c461122d4cbca76194bba08da6eR194
         // GPLv3 does not apply for this function
         private fun mapFromKType(kType: KType): String {
+            // A13: every Java/Kotlin Map reference renders as the synthetic
+            // `JavaMap<K, V>` interface (types/JavaMap.d.ts) — the GraalJS
+            // host surface of a java.util.Map, mirroring the runtime-verified
+            // F8 localStorage facade. The three previous forms all lied at
+            // runtime: index signatures (`{ [key: string]: V }`) invited
+            // bracket access that a host Map does not honor, and the
+            // JS-global `Map<K, V>` named a real lib type whose entire API
+            // (`.set`, `.size` as a property) is wrong on a host object.
+            // Uniform in return AND parameter position; position-aware
+            // widening for input positions is a documented follow-up.
+            usesJavaMap = true
 
             // Maps whose reflected type-argument count isn't 2 (fastutil primitive
             // maps like Int2ObjectMap<V> carry one type param because the key is a
-            // primitive) would index past `arguments` and throw, dropping the call to
-            // the nominal fallback -> an undefined `Int2ObjectMap` name (TS2304).
-            // Render a permissive index signature instead; the precise key/value is
-            // unrecoverable from the erased single arg anyway.
-            if (kType.arguments.size < 2) return "{ [key: string]: any }"
+            // primitive; raw Map usage and Map subtypes fixing K/V also land here)
+            // would index past `arguments` and throw, dropping the call to the
+            // nominal fallback -> an undefined `Int2ObjectMap` name (TS2304).
+            // The true K/V is not recoverable from the class's own erased
+            // arguments — `any, any` is honest; the supertype-walk projection
+            // that could recover it is a documented follow-up backlog item.
+            if (kType.arguments.size < 2) return "JavaMap<any, any>"
 
             val keyType = formatKType(kType.arguments[0].type ?: KotlinAnyOrNull)
             val valueType = formatKType(kType.arguments[1].type ?: KotlinAnyOrNull)
 
-            // No special case for enum keys: this fork emits enums as nominal
-            // classes (class X extends Enum<X>), not literal unions, so a mapped
-            // type `{ [key in X]: V }` is invalid TS - class types are not
-            // assignable to `string | number | symbol` (TS2322 in the .d.ts
-            // itself under skipLibCheck:false). Enum-keyed maps render as
-            // Map<K, V> like every other object-keyed map.
-            return when {
-                keyType.formatWithoutParenthesis() == "string" || keyType.formatWithoutParenthesis() == "number" ->
-                    "{ [key: ${keyType.formatWithoutParenthesis()}]: ${valueType.formatWithoutParenthesis()} }"
-
-                else ->
-                    "Map<${keyType.formatWithoutParenthesis()}, ${valueType.formatWithoutParenthesis()}>"
-            }
-
+            return "JavaMap<${keyType.formatWithoutParenthesis()}, ${valueType.formatWithoutParenthesis()}>"
         }
 
 
@@ -2283,6 +2315,62 @@ class TypeScriptGenerator(
         private val KotlinAnyOrNull = Any::class.createType(nullable = true)
         private val KotlinNotNull = Any::class.createType(nullable = false)
 
+        // A13: path of the synthetic JavaMap module at the types/ root. Root
+        // placement keeps the import path computation identical to the
+        // existing dependent-type imports ("../".repeat(depth) + this).
+        internal const val JAVA_MAP_MODULE_PATH = "JavaMap.d.ts"
+
+        // A13: hand-authored declaration for the GraalJS host surface of a
+        // java.util.Map instance. Member set + nullability mirror the
+        // runtime-verified F8 localStorage facade (ScriptLocalStorage in
+        // typings/ambient/ambient.d.ts), typed K/V instead of `any`.
+        // keySet()/values()/entrySet() stay `any`, NOT arrays: GraalJS
+        // array-maps java.util.List and Java arrays but NOT the live
+        // Set/Collection views these return (no .length, no index access) —
+        // typing them K[]/V[] would be a new runtime lie, the exact class
+        // A13 exists to remove. No bean-property duals (the A15 cascade) and
+        // no JavaMap${'$'}Entry sibling (entrySet is `any`, so none is needed).
+        internal val JAVA_MAP_MODULE_TEXT = """
+            |import type { Object } from './java/lang/Object.d.ts'
+            |
+            |/**
+            | * A13: the GraalJS host surface of a `java.util.Map` instance. Method calls
+            | * only: NO bracket indexing (`m["k"]` reads a member, not an entry), NO
+            | * JS-`Map` API (`.set`, `.size` as a property), NO `for...of` / spread.
+            | */
+            |export interface JavaMap<K, V> extends Object {
+            |    /** Value for `key`, or `null` if absent. */
+            |    get(key: K): V | null;
+            |    /** Stores `value`; returns the previous value or `null`. */
+            |    put(key: K, value: V): V | null;
+            |    /** Stores only if absent; returns the existing value or `null`. */
+            |    putIfAbsent(key: K, value: V): V | null;
+            |    getOrDefault(key: K, defaultValue: V): V;
+            |    /** Removes `key`; returns the removed value or `null`. */
+            |    remove(key: K): V | null;
+            |    containsKey(key: K): boolean;
+            |    clear(): void;
+            |    size(): number;
+            |    isEmpty(): boolean;
+            |    /** Computes a value for `key` (creating it if absent). */
+            |    compute(key: K, remap: (key: K, value: V | null) => V | null): V | null;
+            |    /** Computes and stores a value only if `key` is absent. */
+            |    computeIfAbsent(key: K, mapping: (key: K) => V): V;
+            |    /** Merges `value` into the existing value for `key`. */
+            |    merge(key: K, value: V, remap: (oldValue: V, value: V) => V | null): V | null;
+            |    /** Replaces the value for `key` only if it is currently present. */
+            |    replace(key: K, value: V): V | null;
+            |    /** Runs `action` for every entry. NOTE: Java argument order `(key, value)` - the OPPOSITE of JS `Map#forEach`. */
+            |    forEach(action: (key: K, value: V) => void): void;
+            |    /** The key set (a live Java Set view - not array-mapped by GraalJS). */
+            |    keySet(): any;
+            |    /** The entry set (a live Java Set view - not array-mapped by GraalJS). */
+            |    entrySet(): any;
+            |    /** The values collection (a live Java Collection view - not array-mapped by GraalJS). */
+            |    values(): any;
+            |}
+            |""".trimMargin()
+
         /** Overload identity: name + value-parameter types (drops the receiver).
          * Used by W19 to tell an override from a distinct sibling overload. */
         private fun overloadSignature(f: KFunction<*>): String =
@@ -2477,9 +2565,25 @@ class TypeScriptGenerator(
 
     @Suppress("unused")
     val definitionsAsModules: Map<String, String>
-        get() = modules.map {
-            it.value.path to it.value.moduleText
-        }.toMap()
+        get() {
+            // A13: the synthetic JavaMap module is emitted UNCONDITIONALLY,
+            // not only when some module referenced it — with a warm
+            // ModuleCache, reused moduleTexts carry their
+            // `import type { JavaMap } ...` line verbatim while no fresh
+            // module sets usesJavaMap, so the import target must always
+            // exist. Guard: no real class named JavaMap exists in the
+            // current jar set; if a default-package one ever appears, its
+            // module wins the map merge below (later entry) — log loudly so
+            // the collision is investigated instead of silently shipped.
+            modules.values.firstOrNull { it.path == JAVA_MAP_MODULE_PATH }?.let {
+                System.err.println(
+                    "WARNING (A13): a generated module claimed $JAVA_MAP_MODULE_PATH — " +
+                        "it shadows the synthetic JavaMap module; every JavaMap import is now wrong"
+                )
+            }
+            return mapOf(JAVA_MAP_MODULE_PATH to JAVA_MAP_MODULE_TEXT) +
+                modules.map { it.value.path to it.value.moduleText }
+        }
 
     @Suppress("unused")
     val definitionsText: String
